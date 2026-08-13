@@ -2,14 +2,13 @@
 """
 Canary-моніторинг конвеєра сповіщень.
 
-Алгоритм (ПОВНИЙ КЛОН + АВТОАВТОРИЗАЦІЯ):
-- Автоматичне отримання та оновлення API-токена при 401 Unauthorized.
-- ФАЗА 1 (ПАЛЬНЕ): Швидка заправка (пробиває фільтр згладжування).
-- ФАЗА 2 (ГЕОЗОНИ): Вихід -> Вхід (по 3 точки кожні 5 сек).
-- ФАЗА 3 (ШВИДКІСТЬ): Рух (швидкість 15) -> Зупинка -> Рух -> Зупинка.
+Алгоритм (ПОВНИЙ КЛОН + АВТОАВТОРИЗАЦІЯ + ЧЕКЛІСТ ТЕЛЕГРАМ):
+- ФАЗА 1 (ПАЛЬНЕ): Швидка заправка.
+- ФАЗА 2 (ГЕОЗОНИ): Вихід -> Вхід.
+- ФАЗА 3 (ШВИДКІСТЬ): Рух (15 км/год).
 - ФАЗА 4 (СЕНСОР): Статична відправка пального з рівнем 750 (тригер 701-801).
 - ФАЗА 5 (ПРОСТІЙ): Рух для скидання таймера -> Стоянка 6.5 хвилин (speed=0).
-- Очікування та перевірка історії на наявність усіх 6 подій.
+- Очікування та детальний звіт у Telegram (✅ та ❌).
 """
 
 import ctypes
@@ -18,7 +17,6 @@ import logging
 import os
 import sys
 import time
-import random
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -61,9 +59,9 @@ CONFIG = {
     
     # --- ПАРАМЕТРИ ПЛАТФОРМНОГО API ---
     "api_base_url": "https://my.m2m.eu/api",
-    "api_email": os.getenv("M2M_EMAIL", ""),        # НОВЕ: Логін
-    "api_password": os.getenv("M2M_PASSWORD", ""),  # НОВЕ: Пароль
-    "api_token": os.getenv("M2M_API_TOKEN", ""),    # Залишається як опція, але не обов'язково
+    "api_email": os.getenv("M2M_EMAIL", ""),        
+    "api_password": os.getenv("M2M_PASSWORD", ""),  
+    "api_token": os.getenv("M2M_API_TOKEN", ""),    
     "login_path": "/login",
     "history_path": "/notification/history",
     "history_query": {"page": 1, "per_page": 50},
@@ -87,7 +85,7 @@ CONFIG = {
     "sensor_trigger_value": 750,   
 
     # --- ПАРАМЕТРИ ПРОСТОЮ (IDLE) ---
-    "idle_points_count": 13,       # 13 точок по 30 сек = 390 сек (6.5 хвилин)
+    "idle_points_count": 13,       
     "idle_interval_sec": 30,
 
     "initial_wait_sec": 120,   
@@ -139,9 +137,6 @@ def send_canary_events(cfg: dict) -> datetime:
     in_lat, in_lon = cfg["geo_in_lat"], cfg["geo_in_lon"]
     out_lat, out_lon = cfg["geo_out_lat"], cfg["geo_out_lon"]
 
-    # ======================================================================
-    # БЛОК 1: СТОЯНКА ТА ЗАПРАВКА
-    # ======================================================================
     log.info("--- ФАЗА 1/5: ПАЛЬНЕ ---")
     log.info("Стабілізація старту (%s л)", lo)
     for i in range(cfg["edge_repeats"]):
@@ -160,9 +155,6 @@ def send_canary_events(cfg: dict) -> datetime:
         _send_point(cfg, hi, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
-    # ======================================================================
-    # БЛОК 2: ГЕОЗОНИ
-    # ======================================================================
     log.info("--- ФАЗА 2/5: ГЕОЗОНИ ---")
     for cycle in range(cfg["geo_cycles"]):
         log.info("Відправка ВИХОДУ (GEO_OUT)")
@@ -180,9 +172,6 @@ def send_canary_events(cfg: dict) -> datetime:
         if cycle < cfg["geo_cycles"] - 1:
             time.sleep(cfg["geo_wait_sec"])
 
-    # ======================================================================
-    # БЛОК 3: ПЕРЕВИЩЕННЯ ШВИДКОСТІ
-    # ======================================================================
     log.info("--- ФАЗА 3/5: ШВИДКІСТЬ (OVERSPEED) ---")
     current_lat, current_lon = in_lat, in_lon
     
@@ -199,18 +188,12 @@ def send_canary_events(cfg: dict) -> datetime:
             _send_point(cfg, hi, current_lat, current_lon, speed=0)
             time.sleep(5)
 
-    # ======================================================================
-    # БЛОК 4: ЗНАЧЕННЯ ДАТЧИКА (SENSOR VALUE)
-    # ======================================================================
     log.info("--- ФАЗА 4/5: ЗНАЧЕННЯ ДАТЧИКА ---")
     log.info(f"Відправка рівня пального {cfg['sensor_trigger_value']} л (Тригер 701-801)")
     for i in range(3):
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
         time.sleep(5)
 
-    # ======================================================================
-    # БЛОК 5: ПРОСТІЙ (IDLE / СТОЯНКА)
-    # ======================================================================
     log.info("--- ФАЗА 5/5: ПРОСТІЙ (IDLE) ---")
     log.info("1. Рух для скидання таймера стоянки...")
     current_lat += 0.0002
@@ -233,7 +216,6 @@ def send_canary_events(cfg: dict) -> datetime:
 # --------------------------------------------------------------------------
 
 def refresh_api_token(cfg: dict) -> None:
-    """Отримує новий API-токен за допомогою логіна та пароля."""
     if not cfg["api_email"] or not cfg["api_password"]:
         raise ValueError("Відсутні облікові дані (M2M_EMAIL, M2M_PASSWORD) для автооновлення токена.")
 
@@ -260,7 +242,6 @@ def refresh_api_token(cfg: dict) -> None:
 
 
 def fetch_history(cfg: dict) -> dict:
-    """Отримує історію з автооновленням токена при 401 помилці."""
     if not cfg["api_token"]:
         refresh_api_token(cfg)
 
@@ -269,7 +250,6 @@ def fetch_history(cfg: dict) -> dict:
     
     resp = requests.get(url, headers=headers, params=cfg["history_query"], timeout=cfg["http_timeout_sec"])
     
-    # Якщо токен протух - оновлюємо і повторюємо запит 1 раз
     if resp.status_code == 401:
         log.warning("API-токен прострочений (401). Виконую автооновлення...")
         refresh_api_token(cfg)
@@ -296,13 +276,16 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
     data = fetch_history(cfg)
     items = data.get("items", [])
 
-    found_refill = False
-    found_geo_in = False
-    found_geo_out = False
-    found_overspeed = False
-    found_sensor = False
-    found_idle = False
-    details_list = []
+    # Статуси для чекліста
+    status = {
+        "REFILL": False,
+        "GEO_IN": False,
+        "GEO_OUT": False,
+        "OVERSPEED": False,
+        "SENSOR": False,
+        "IDLE": False
+    }
+    refill_volume_str = ""
 
     for item in items:
         event_id = item.get("id")
@@ -351,7 +334,8 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         try:
             meta = json.loads(item.get("metadata", "{}"))
             
-            if ev_type in ("REFILL", "DRAIN"):
+            if ev_type == "REFILL":
+                status["REFILL"] = True
                 finish = meta.get("fuelFinishValue", "невідомо")
                 start_val = meta.get("fuelStartValue", "невідомо")
                 volume = meta.get("fuelVolume")
@@ -360,61 +344,45 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
                         volume = round(abs(finish - start_val), 2)
                     else:
                         volume = "невідомо"
-                
+                refill_volume_str = f"({volume} л)"
                 log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм={volume} л.")
-                if ev_type == "REFILL":
-                    found_refill = True
-                    event_str = f"REFILL ({volume} л)"
-                    if event_str not in details_list: details_list.append(event_str)
             
-            elif ev_type in ("GEO_IN", "GEO_OUT"):
-                zone_name = meta.get("geofenceName", "невідома зона")
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): зона='{zone_name}'")
-                
-                if ev_type == "GEO_IN":
-                    found_geo_in = True
-                    event_str = "ВХІД (GEO_IN)"
-                    if event_str not in details_list: details_list.append(event_str)
-                elif ev_type == "GEO_OUT":
-                    found_geo_out = True
-                    event_str = "ВИХІД (GEO_OUT)"
-                    if event_str not in details_list: details_list.append(event_str)
-
+            elif ev_type == "GEO_IN":
+                status["GEO_IN"] = True
+                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
+            elif ev_type == "GEO_OUT":
+                status["GEO_OUT"] = True
+                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
             elif ev_type == "OVERSPEED":
+                status["OVERSPEED"] = True
                 log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-                found_overspeed = True
-                event_str = "ПЕРЕВИЩЕННЯ ШВИДКОСТІ"
-                if event_str not in details_list: details_list.append(event_str)
-
             elif ev_type == "SENSOR_VALUE":
+                status["SENSOR"] = True
                 log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-                found_sensor = True
-                event_str = "ДАТЧИК (SENSOR_VALUE)"
-                if event_str not in details_list: details_list.append(event_str)
-
             elif ev_type == "IDLE":
+                status["IDLE"] = True
                 log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-                found_idle = True
-                event_str = "ПРОСТІЙ (IDLE)"
-                if event_str not in details_list: details_list.append(event_str)
                     
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
 
-    if found_refill and found_geo_in and found_geo_out and found_overspeed and found_sensor and found_idle:
-        found_str = ", ".join(details_list)
-        return True, f"Знайдено всі необхідні події:\n{found_str}"
+    # Формуємо красивий текст звіту для Telegram
+    report_lines = [
+        f"{'✅' if status['REFILL'] else '❌'} Заправка {refill_volume_str}".strip(),
+        f"{'✅' if status['GEO_OUT'] else '❌'} Вихід з геозони",
+        f"{'✅' if status['GEO_IN'] else '❌'} Вхід у геозону",
+        f"{'✅' if status['OVERSPEED'] else '❌'} Швидкість",
+        f"{'✅' if status['SENSOR'] else '❌'} Значення датчика",
+        f"{'✅' if status['IDLE'] else '❌'} Простій"
+    ]
+    report_str = "\n".join(report_lines)
 
-    missing = []
-    if not found_refill: missing.append("REFILL")
-    if not found_geo_out: missing.append("ВИХІД (GEO_OUT)")
-    if not found_geo_in: missing.append("ВХІД (GEO_IN)")
-    if not found_overspeed: missing.append("ШВИДКІСТЬ")
-    if not found_sensor: missing.append("ДАТЧИК")
-    if not found_idle: missing.append("ПРОСТІЙ")
+    # Якщо ВСІ статуси = True
+    if all(status.values()):
+        return True, f"Усі типи сповіщень успішно відпрацювали:\n\n{report_str}"
     
-    found_str = ", ".join(details_list) if details_list else "нічого"
-    return False, f"Бракує: {', '.join(missing)}. Знайдено поки що: {found_str}"
+    # Якщо хоча б один статус = False
+    return False, f"Статус перевірки:\n\n{report_str}"
 
 
 def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
@@ -480,7 +448,7 @@ def show_popup(cfg: dict, title: str, text: str, is_error: bool) -> None:
 def notify_incident(cfg: dict, detail: str) -> None:
     text = (
         "🔴 Конвеєр сповіщень працює з перебоями!\n"
-        f"Canary перевірка не дочекалася всіх подій.\n{detail}\n"
+        f"Canary перевірка не дочекалася всіх подій.\n{detail}\n\n"
         "Ймовірно завис worker/consumer на беку -- перевір логи."
     )
     log.error(text)
@@ -526,7 +494,6 @@ def main() -> int:
     if "--inspect" in sys.argv:
         return inspect_mode(cfg)
 
-    # Перевірка наявності хоча б якогось способу авторизації
     if not cfg["api_token"] and not (cfg["api_email"] and cfg["api_password"]):
         log.error("🚨 Не задано облікових даних! Вкажіть M2M_API_TOKEN або пару M2M_EMAIL та M2M_PASSWORD.")
         return 1
@@ -561,7 +528,7 @@ def main() -> int:
         return 1
     except Exception as e:
         log.exception("Не вдалось перевірити історію через API")
-        notify_incident(cfg, f"Помилка запиту до API історії: {e}")
+        notify_incident(cfg, f"Помилка запиту до API історії:\n{e}")
         return 1
 
     if ok:
