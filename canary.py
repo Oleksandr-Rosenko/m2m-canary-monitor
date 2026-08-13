@@ -2,13 +2,13 @@
 """
 Canary-моніторинг конвеєра сповіщень.
 
-Алгоритм (ПОВНИЙ КЛОН + АВТОАВТОРИЗАЦІЯ + ЧЕКЛІСТ ТЕЛЕГРАМ):
-- ФАЗА 1 (ПАЛЬНЕ): Швидка заправка.
-- ФАЗА 2 (ГЕОЗОНИ): Вихід -> Вхід.
-- ФАЗА 3 (ШВИДКІСТЬ): Рух (15 км/год).
-- ФАЗА 4 (СЕНСОР): Статична відправка пального з рівнем 750 (тригер 701-801).
-- ФАЗА 5 (ПРОСТІЙ): Рух для скидання таймера -> Стоянка 6.5 хвилин (speed=0).
-- Очікування та детальний звіт у Telegram (✅ та ❌).
+Алгоритм (ПОВНИЙ КЛОН + ВСІ 7 ТИПІВ ПОДІЙ):
+- ФАЗА 1: Заправка (400 -> 700 л).
+- ФАЗА 2: Геозони (Вихід -> Вхід).
+- ФАЗА 3: Швидкість (Рух 15 км/год).
+- ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
+- ФАЗА 5: Простій (Стоянка 7 хвилин).
+- ФАЗА 6: Злив (Різке падіння до 350 л) + Рух для закриття простою.
 """
 
 import ctypes
@@ -83,10 +83,7 @@ CONFIG = {
     # --- ПАРАМЕТРИ ШВИДКІСТЬ/СЕНСОР ---
     "overspeed_value": 15,         
     "sensor_trigger_value": 750,   
-
-    # --- ПАРАМЕТРИ ПРОСТОЮ (IDLE) ---
-    "idle_points_count": 13,       
-    "idle_interval_sec": 30,
+    "drain_target_value": 350,     # Рівень для генерації зливу
 
     "initial_wait_sec": 120,   
     "poll_interval_sec": 30,   
@@ -137,7 +134,7 @@ def send_canary_events(cfg: dict) -> datetime:
     in_lat, in_lon = cfg["geo_in_lat"], cfg["geo_in_lon"]
     out_lat, out_lon = cfg["geo_out_lat"], cfg["geo_out_lon"]
 
-    log.info("--- ФАЗА 1/5: ПАЛЬНЕ ---")
+    log.info("--- ФАЗА 1/6: ПАЛЬНЕ (ЗАПРАВКА) ---")
     log.info("Стабілізація старту (%s л)", lo)
     for i in range(cfg["edge_repeats"]):
         _send_point(cfg, lo, in_lat, in_lon)
@@ -155,7 +152,7 @@ def send_canary_events(cfg: dict) -> datetime:
         _send_point(cfg, hi, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
-    log.info("--- ФАЗА 2/5: ГЕОЗОНИ ---")
+    log.info("--- ФАЗА 2/6: ГЕОЗОНИ ---")
     for cycle in range(cfg["geo_cycles"]):
         log.info("Відправка ВИХОДУ (GEO_OUT)")
         for i in range(cfg["geo_points_count"]):
@@ -172,7 +169,7 @@ def send_canary_events(cfg: dict) -> datetime:
         if cycle < cfg["geo_cycles"] - 1:
             time.sleep(cfg["geo_wait_sec"])
 
-    log.info("--- ФАЗА 3/5: ШВИДКІСТЬ (OVERSPEED) ---")
+    log.info("--- ФАЗА 3/6: ШВИДКІСТЬ (OVERSPEED) ---")
     current_lat, current_lon = in_lat, in_lon
     
     for cycle in range(2):
@@ -188,24 +185,32 @@ def send_canary_events(cfg: dict) -> datetime:
             _send_point(cfg, hi, current_lat, current_lon, speed=0)
             time.sleep(5)
 
-    log.info("--- ФАЗА 4/5: ЗНАЧЕННЯ ДАТЧИКА ---")
+    log.info("--- ФАЗА 4/6: ЗНАЧЕННЯ ДАТЧИКА ---")
     log.info(f"Відправка рівня пального {cfg['sensor_trigger_value']} л (Тригер 701-801)")
     for i in range(3):
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
         time.sleep(5)
 
-    log.info("--- ФАЗА 5/5: ПРОСТІЙ (IDLE) ---")
+    log.info("--- ФАЗА 5/6: ПРОСТІЙ (IDLE) ---")
     log.info("1. Рух для скидання таймера стоянки...")
     current_lat += 0.0002
     current_lon += 0.0002
     _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=cfg["overspeed_value"])
     time.sleep(10)
 
-    log.info(f"2. Стоянка 6.5 хвилин для тригеру (>5 хв). Відправка {cfg['idle_points_count']} точок кожні {cfg['idle_interval_sec']} сек...")
-    for i in range(cfg["idle_points_count"]):
+    log.info("2. Стоянка 7 хвилин для тригеру (>5 хв). Відправка точок кожні 30 сек...")
+    idle_points = 14
+    for i in range(idle_points):
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
-        if i < cfg["idle_points_count"] - 1:
-            time.sleep(cfg["idle_interval_sec"])
+        if i < idle_points - 1:
+            time.sleep(30)
+
+    log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ТА ЗАКРИТТЯ ПРОСТОЮ ---")
+    log.info(f"Рух (для закриття простою) + Різке падіння пального до {cfg['drain_target_value']} л (для зливу)...")
+    current_lat += 0.0002
+    for i in range(3):
+        _send_point(cfg, cfg["drain_target_value"], current_lat, current_lon, speed=cfg["overspeed_value"])
+        time.sleep(5)
 
     log.info("Весь профіль повністю відправлено!")
     return start_time
@@ -276,9 +281,10 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
     data = fetch_history(cfg)
     items = data.get("items", [])
 
-    # Статуси для чекліста
+    # Статуси для чекліста (додано DRAIN)
     status = {
         "REFILL": False,
+        "DRAIN": False,
         "GEO_IN": False,
         "GEO_OUT": False,
         "OVERSPEED": False,
@@ -286,6 +292,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         "IDLE": False
     }
     refill_volume_str = ""
+    drain_volume_str = ""
 
     for item in items:
         event_id = item.get("id")
@@ -346,6 +353,19 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
                         volume = "невідомо"
                 refill_volume_str = f"({volume} л)"
                 log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм={volume} л.")
+                
+            elif ev_type == "DRAIN":
+                status["DRAIN"] = True
+                finish = meta.get("fuelFinishValue", "невідомо")
+                start_val = meta.get("fuelStartValue", "невідомо")
+                volume = meta.get("fuelVolume")
+                if volume is None:
+                    if isinstance(finish, (int, float)) and isinstance(start_val, (int, float)):
+                        volume = round(abs(start_val - finish), 2)
+                    else:
+                        volume = "невідомо"
+                drain_volume_str = f"({volume} л)"
+                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм={volume} л.")
             
             elif ev_type == "GEO_IN":
                 status["GEO_IN"] = True
@@ -366,9 +386,10 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
 
-    # Формуємо красивий текст звіту для Telegram
+    # Формуємо красивий текст звіту для Telegram (Додано Злив)
     report_lines = [
         f"{'✅' if status['REFILL'] else '❌'} Заправка {refill_volume_str}".strip(),
+        f"{'✅' if status['DRAIN'] else '❌'} Злив {drain_volume_str}".strip(),
         f"{'✅' if status['GEO_OUT'] else '❌'} Вихід з геозони",
         f"{'✅' if status['GEO_IN'] else '❌'} Вхід у геозону",
         f"{'✅' if status['OVERSPEED'] else '❌'} Швидкість",
@@ -448,7 +469,7 @@ def show_popup(cfg: dict, title: str, text: str, is_error: bool) -> None:
 def notify_incident(cfg: dict, detail: str) -> None:
     text = (
         "🔴 Конвеєр сповіщень працює з перебоями!\n"
-        f"Canary перевірка не дочекалася всіх подій.\n{detail}\n\n"
+        f"Canary перевірка не дочекалася всіх подій.\n\n{detail}\n\n"
         "Ймовірно завис worker/consumer на беку -- перевір логи."
     )
     log.error(text)
