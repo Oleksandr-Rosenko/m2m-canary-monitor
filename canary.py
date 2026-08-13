@@ -489,6 +489,8 @@ def notify_recovery(cfg: dict) -> None:
 def notify_success(cfg: dict, detail: str) -> None:
     text = f"✅ Тестування завершено успішно!\n\n{detail}"
     show_popup(cfg, "Canary: УСПІХ", text, is_error=False)
+    send_telegram(cfg, text)
+    send_slack(cfg, text)
 
 
 # --------------------------------------------------------------------------
