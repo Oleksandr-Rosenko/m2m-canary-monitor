@@ -7,8 +7,9 @@ Canary-моніторинг конвеєра сповіщень.
 - ФАЗА 2: Геозони (Вихід -> Вхід).
 - ФАЗА 3: Швидкість (Рух 15 км/год).
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
-- ФАЗА 5: Простій (Стоянка 7 хвилин).
-- ФАЗА 6: Злив (Різке падіння до 350 л) + Рух для закриття простою.
+- ФАЗА 5: Простій (Стоянка 5.5 хвилин).
+- ФАЗА 6: Злив (Поступове падіння до 350 л за 6 точок) + Рух.
+- Оновлені тексти сповіщень у Telegram.
 """
 
 import ctypes
@@ -83,7 +84,15 @@ CONFIG = {
     # --- ПАРАМЕТРИ ШВИДКІСТЬ/СЕНСОР ---
     "overspeed_value": 15,         
     "sensor_trigger_value": 750,   
-    "drain_target_value": 350,     # Рівень для генерації зливу
+    
+    # --- ПАРАМЕТРИ ПРОСТОЮ (IDLE) ---
+    "idle_points_count": 12,       
+    "idle_interval_sec": 30,
+
+    # --- ПАРАМЕТРИ ЗЛИВУ (DRAIN) ---
+    "drain_target_value": 350,     
+    "drain_points_count": 6,       
+    "drain_interval_sec": 15,      
 
     "initial_wait_sec": 120,   
     "poll_interval_sec": 30,   
@@ -198,19 +207,25 @@ def send_canary_events(cfg: dict) -> datetime:
     _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=cfg["overspeed_value"])
     time.sleep(10)
 
-    log.info("2. Стоянка 7 хвилин для тригеру (>5 хв). Відправка точок кожні 30 сек...")
-    idle_points = 14
-    for i in range(idle_points):
+    log.info(f"2. Стоянка 5.5 хвилин для тригеру (>5 хв). Відправка {cfg['idle_points_count']} точок кожні {cfg['idle_interval_sec']} сек...")
+    for i in range(cfg["idle_points_count"]):
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
-        if i < idle_points - 1:
-            time.sleep(30)
+        if i < cfg["idle_points_count"] - 1:
+            time.sleep(cfg["idle_interval_sec"])
 
     log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ТА ЗАКРИТТЯ ПРОСТОЮ ---")
-    log.info(f"Рух (для закриття простою) + Різке падіння пального до {cfg['drain_target_value']} л (для зливу)...")
+    start_drain = cfg["sensor_trigger_value"]
+    end_drain = cfg["drain_target_value"]
+    drain_pts = cfg["drain_points_count"]
+    
+    log.info(f"Рух (для закриття простою) + Поступовий злив {start_drain} -> {end_drain} л (точок: {drain_pts}, інтервал: {cfg['drain_interval_sec']}с)...")
     current_lat += 0.0002
-    for i in range(3):
-        _send_point(cfg, cfg["drain_target_value"], current_lat, current_lon, speed=cfg["overspeed_value"])
-        time.sleep(5)
+    drain_step = (end_drain - start_drain) / (drain_pts - 1) if drain_pts > 1 else 0
+    
+    for i in range(drain_pts):
+        current_level = start_drain + drain_step * i
+        _send_point(cfg, current_level, current_lat, current_lon, speed=cfg["overspeed_value"])
+        time.sleep(cfg["drain_interval_sec"])
 
     log.info("Весь профіль повністю відправлено!")
     return start_time
@@ -281,7 +296,6 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
     data = fetch_history(cfg)
     items = data.get("items", [])
 
-    # Статуси для чекліста (додано DRAIN)
     status = {
         "REFILL": False,
         "DRAIN": False,
@@ -386,7 +400,6 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
 
-    # Формуємо красивий текст звіту для Telegram (Додано Злив)
     report_lines = [
         f"{'✅' if status['REFILL'] else '❌'} Заправка {refill_volume_str}".strip(),
         f"{'✅' if status['DRAIN'] else '❌'} Злив {drain_volume_str}".strip(),
@@ -398,12 +411,10 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
     ]
     report_str = "\n".join(report_lines)
 
-    # Якщо ВСІ статуси = True
     if all(status.values()):
-        return True, f"Усі типи сповіщень успішно відпрацювали:\n\n{report_str}"
+        return True, report_str
     
-    # Якщо хоча б один статус = False
-    return False, f"Статус перевірки:\n\n{report_str}"
+    return False, report_str
 
 
 def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
@@ -424,7 +435,7 @@ def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> 
             return True, detail
             
         if time.monotonic() >= deadline:
-            return False, f"Таймаут ({cfg['max_wait_sec']} сек). {detail}"
+            return False, f"Таймаут ({cfg['max_wait_sec']} сек).\n\n{detail}"
             
         time.sleep(cfg["poll_interval_sec"])
 
@@ -468,8 +479,8 @@ def show_popup(cfg: dict, title: str, text: str, is_error: bool) -> None:
 
 def notify_incident(cfg: dict, detail: str) -> None:
     text = (
-        "🔴 Конвеєр сповіщень працює з перебоями!\n"
-        f"Canary перевірка не дочекалася всіх подій.\n\n{detail}\n\n"
+        "🔴 Спрацювали не всі сповіщення !\n\n"
+        f"{detail}\n\n"
         "Ймовірно завис worker/consumer на беку -- перевір логи."
     )
     log.error(text)
@@ -479,7 +490,7 @@ def notify_incident(cfg: dict, detail: str) -> None:
 
 
 def notify_recovery(cfg: dict) -> None:
-    text = "🟢 Конвеєр сповіщень відновився, canary-перевірка пройдена повністю."
+    text = "🟢 Конвеєр сповіщень відновився, всі типи сповіщень працюють коректно!"
     log.info(text)
     show_popup(cfg, "Canary: Відновлено", text, is_error=False)
     send_telegram(cfg, text)
@@ -487,7 +498,7 @@ def notify_recovery(cfg: dict) -> None:
 
 
 def notify_success(cfg: dict, detail: str) -> None:
-    text = f"✅ Тестування завершено успішно!\n\n{detail}"
+    text = f"✅ Всі типи сповіщень працюють коректно !\n\n{detail}"
     show_popup(cfg, "Canary: УСПІХ", text, is_error=False)
     send_telegram(cfg, text)
     send_slack(cfg, text)
