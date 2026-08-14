@@ -10,7 +10,8 @@ on:
 jobs:
   run-canary:
     runs-on: ubuntu-latest
-
+    env:
+      TZ: Europe/Kyiv
     steps:
     - name: Отримання коду
       uses: actions/checkout@v3
