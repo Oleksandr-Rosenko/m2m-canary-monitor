@@ -2,12 +2,12 @@
 """
 Canary-моніторинг конвеєра сповіщень.
 
-Алгоритм (ПОВНИЙ КЛОН + ВСІ 8 ТИПІВ ПОДІЙ):
+Алгоритм (ПОВНИЙ КЛОН + ВСІ 8 ТИПІВ ПОДІЙ + БРОНЕБІЙНИЙ ПАРСЕР):
 - ФАЗА 1: Заправка (400 -> 700 л).
 - ФАЗА 2: Геозони (Вихід -> Вхід).
 - ФАЗА 3: Швидкість (Рух 15 км/год).
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
-- ФАЗА 5: Простій (Стоянка 5.5 хв) + Результат команди (result=CommandSentSuccess).
+- ФАЗА 5: Простій (Стоянка 5.5 хв) + Результат команди.
 - ФАЗА 6: Злив (Поступове падіння до 350 л за 6 точок на швидкості 0).
 """
 
@@ -41,7 +41,7 @@ CONFIG = {
     "template_overspeed": "TEST_Notification-Rosenko_Overspeed",
     "template_sensor": "TEST_Notification-Rosenko_SensorValue",
     "template_idle": "TEST_Notification-Rosenko_Idle",
-    "template_command": "Результат команди",  # <--- НОВИЙ ШАБЛОН
+    "template_command": "Результат команди",  
     
     "tracker_imei": "123456789011111",
     
@@ -132,7 +132,6 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
         f"timestamp={timestamp}"
     )
     
-    # Якщо передано параметр result (для команди), додаємо його в URL
     if result_param:
         url += f"&result={result_param}"
     
@@ -213,7 +212,6 @@ def send_canary_events(cfg: dict) -> datetime:
 
     log.info(f"2. Стоянка 5.5 хвилин для тригеру (>5 хв). Відправка {cfg['idle_points_count']} точок кожні {cfg['idle_interval_sec']} сек...")
     for i in range(cfg["idle_points_count"]):
-        # На найпершій точці простою також відправляємо команду!
         if i == 0:
             log.info("   -> Додаємо параметр result=CommandSentSuccess у першу точку простою")
             res_val = "CommandSentSuccess"
@@ -315,7 +313,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         "OVERSPEED": False,
         "SENSOR": False,
         "IDLE": False,
-        "COMMAND": False   # <--- НОВИЙ СТАТУС
+        "COMMAND": False
     }
     refill_volume_str = ""
     drain_volume_str = ""
@@ -326,38 +324,41 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             continue
 
         item_str = json.dumps(item, ensure_ascii=False)
+        item_lower = item_str.lower()
         
         match_id = (item.get("deviceId") == cfg["device_id"])
         match_dev_name = (item.get("deviceName") == cfg["device_name"])
         
-        match_tpl_refill = (cfg["template_refill"] in item_str)
-        match_tpl_drain = (cfg["template_drain"] in item_str)
-        match_tpl_geo_in = (cfg["template_geo_in"] in item_str)
-        match_tpl_geo_out = (cfg["template_geo_out"] in item_str)
-        match_tpl_overspeed = (cfg["template_overspeed"] in item_str)
-        match_tpl_sensor = (cfg["template_sensor"] in item_str)
-        match_tpl_idle = (cfg["template_idle"] in item_str)
-        match_tpl_command = (cfg["template_command"] in item_str)  # <--- ПЕРЕВІРКА КОМАНДИ
-        
-        if not (match_id or match_dev_name or match_tpl_refill or match_tpl_drain or match_tpl_geo_in or match_tpl_geo_out or match_tpl_overspeed or match_tpl_sensor or match_tpl_idle or match_tpl_command):
+        # Надійна перевірка приналежності події
+        if not (match_id or match_dev_name or cfg["device_name"].lower() in item_lower):
             continue
             
-        ev_type = item.get("type")
-        if match_tpl_refill: ev_type = "REFILL"
-        elif match_tpl_drain: ev_type = "DRAIN"
-        elif match_tpl_geo_in: ev_type = "GEO_IN"
-        elif match_tpl_geo_out: ev_type = "GEO_OUT"
-        elif match_tpl_overspeed: ev_type = "OVERSPEED"
-        elif match_tpl_sensor: ev_type = "SENSOR_VALUE"
-        elif match_tpl_idle: ev_type = "IDLE"
-        elif match_tpl_command: ev_type = "COMMAND"
-        elif ev_type == "geofenceEnter": ev_type = "GEO_IN"
-        elif ev_type == "geofenceExit": ev_type = "GEO_OUT"
+        raw_type = item.get("type", "")
+        
+        # --- БРОНЕБІЙНИЙ ПАРСЕР ПОДІЙ ---
+        ev_type = None
+        if (cfg["template_refill"] in item_str) or (raw_type == "refill") or ("заправка" in item_lower):
+            ev_type = "REFILL"
+        elif (cfg["template_drain"] in item_str) or (raw_type == "drain") or ("злив" in item_lower):
+            ev_type = "DRAIN"
+        elif (cfg["template_geo_in"] in item_str) or (raw_type == "geofenceEnter"):
+            ev_type = "GEO_IN"
+        elif (cfg["template_geo_out"] in item_str) or (raw_type == "geofenceExit"):
+            ev_type = "GEO_OUT"
+        elif (cfg["template_overspeed"] in item_str) or (raw_type == "deviceOverspeed") or ("допустиму швидкість" in item_lower):
+            ev_type = "OVERSPEED"
+        elif (cfg["template_sensor"] in item_str) or ("спрацював датчик" in item_lower) or ("значенням 750" in item_lower):
+            ev_type = "SENSOR_VALUE"
+        elif (cfg["template_idle"] in item_str) or (raw_type == "deviceIdle") or ("простою" in item_lower):
+            ev_type = "IDLE"
+        elif (cfg["template_command"] in item_str) or (raw_type == "commandResult") or ("commandsentsuccess" in item_lower):
+            ev_type = "COMMAND"
             
-        if ev_type not in ("REFILL", "DRAIN", "GEO_IN", "GEO_OUT", "OVERSPEED", "SENSOR_VALUE", "IDLE", "COMMAND"):
+        if not ev_type:
             continue
 
-        created_at_raw = item.get("createdAt")
+        # Підтримка різних варіантів поля часу від API
+        created_at_raw = item.get("createdAt") or item.get("eventTime") or item.get("serverTime")
         try:
             created_at = datetime.fromisoformat(created_at_raw)
         except (TypeError, ValueError):
@@ -367,8 +368,10 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             continue  
 
         try:
-            meta = json.loads(item.get("metadata", "{}"))
-            
+            meta = item.get("metadata", {})
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+                
             if ev_type == "REFILL":
                 status["REFILL"] = True
                 finish = meta.get("fuelFinishValue", "невідомо")
@@ -425,7 +428,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         f"{'✅' if status['OVERSPEED'] else '❌'} Швидкість",
         f"{'✅' if status['SENSOR'] else '❌'} Значення датчика",
         f"{'✅' if status['IDLE'] else '❌'} Простій",
-        f"{'✅' if status['COMMAND'] else '❌'} Результат команди"  # <--- ДОДАНО В ТЕЛЕГРАМ
+        f"{'✅' if status['COMMAND'] else '❌'} Результат команди" 
     ]
     report_str = "\n".join(report_lines)
 
