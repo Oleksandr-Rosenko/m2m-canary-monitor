@@ -8,7 +8,7 @@ Canary-моніторинг конвеєра сповіщень.
 - ФАЗА 3: Швидкість (Рух 15 км/год).
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
 - ФАЗА 5: Простій (Стоянка 5.5 хвилин).
-- ФАЗА 6: Злив (Поступове падіння до 350 л за 6 точок) + Рух.
+- ФАЗА 6: Злив (Поступове падіння до 350 л за 6 точок на швидкості 0).
 - Оновлені тексти сповіщень у Telegram.
 """
 
@@ -213,18 +213,18 @@ def send_canary_events(cfg: dict) -> datetime:
         if i < cfg["idle_points_count"] - 1:
             time.sleep(cfg["idle_interval_sec"])
 
-    log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ТА ЗАКРИТТЯ ПРОСТОЮ ---")
+    log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ---")
     start_drain = cfg["sensor_trigger_value"]
     end_drain = cfg["drain_target_value"]
     drain_pts = cfg["drain_points_count"]
     
-    log.info(f"Рух (для закриття простою) + Поступовий злив {start_drain} -> {end_drain} л (точок: {drain_pts}, інтервал: {cfg['drain_interval_sec']}с)...")
-    current_lat += 0.0002
+    log.info(f"Стоянка (швидкість 0) + Поступовий злив {start_drain} -> {end_drain} л (точок: {drain_pts}, інтервал: {cfg['drain_interval_sec']}с)...")
     drain_step = (end_drain - start_drain) / (drain_pts - 1) if drain_pts > 1 else 0
     
     for i in range(drain_pts):
         current_level = start_drain + drain_step * i
-        _send_point(cfg, current_level, current_lat, current_lon, speed=cfg["overspeed_value"])
+        # Швидкість = 0, щоб бекенд розпізнав це як реальний злив, а не коливання в русі
+        _send_point(cfg, current_level, current_lat, current_lon, speed=0)
         time.sleep(cfg["drain_interval_sec"])
 
     log.info("Весь профіль повністю відправлено!")
