@@ -9,6 +9,7 @@ Canary-моніторинг конвеєра сповіщень.
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
 - ФАЗА 5: Простій (Стоянка 5.5 хв) + Результат команди.
 - ФАЗА 6: Злив (Плавне падіння 750 -> 350 л) + СТАБІЛІЗАЦІЯ (Плато).
+- НЕЗАЛЕЖНА ВІД МЕТАДАНИХ ФІКСАЦІЯ СТАТУСУ.
 """
 
 import ctypes
@@ -226,15 +227,14 @@ def send_canary_events(cfg: dict) -> datetime:
     start_drain = cfg["sensor_trigger_value"]
     end_drain = cfg["drain_target_value"]
     
-    # Спеціальна плавна крива зливу (більші кроки спочатку, менші в кінці)
     drain_levels = [
-        start_drain - 80,  # 670
-        start_drain - 160, # 590
-        start_drain - 240, # 510
-        start_drain - 300, # 450
-        start_drain - 340, # 410
-        start_drain - 370, # 380
-        end_drain          # 350
+        start_drain - 80,  
+        start_drain - 160, 
+        start_drain - 240, 
+        start_drain - 300, 
+        start_drain - 340, 
+        start_drain - 370, 
+        end_drain          
     ]
     
     log.info(f"Стоянка (швидкість 0) + Плавний злив {start_drain} -> {end_drain} л (точок: {len(drain_levels)}, інтервал: {cfg['drain_interval_sec']}с)...")
@@ -346,7 +346,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             
         raw_type = item.get("type", "")
         
-        # --- БРОНЕБІЙНИЙ ПАРСЕР ПОДІЙ ---
+        # --- РОЗПІЗНАВАННЯ ПОДІЙ ---
         ev_type = None
         if (cfg["template_refill"] in item_str) or (raw_type == "refill") or ("заправка" in item_lower):
             ev_type = "REFILL"
@@ -368,67 +368,52 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         if not ev_type:
             continue
 
-        created_at_raw = item.get("createdAt") or item.get("eventTime") or item.get("serverTime")
-        try:
-            created_at = datetime.fromisoformat(created_at_raw)
-        except (TypeError, ValueError):
-            continue
-            
-        if created_at < start_time:
-            continue  
+        # ОДРАЗУ ставимо статус True, щоб ніяка помилка не скасувала знахідку!
+        if ev_type == "IDLE":
+            status["IDLE"] = True
+            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ IDLE (id={event_id})")
+        elif ev_type == "GEO_IN":
+            status["GEO_IN"] = True
+            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ GEO_IN (id={event_id})")
+        elif ev_type == "GEO_OUT":
+            status["GEO_OUT"] = True
+            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ GEO_OUT (id={event_id})")
+        elif ev_type == "OVERSPEED":
+            status["OVERSPEED"] = True
+            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ OVERSPEED (id={event_id})")
+        elif ev_type == "SENSOR_VALUE":
+            status["SENSOR"] = True
+            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ SENSOR_VALUE (id={event_id})")
+        elif ev_type == "COMMAND":
+            status["COMMAND"] = True
+            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ COMMAND (id={event_id})")
 
-        try:
-            meta = item.get("metadata", {})
-            if isinstance(meta, str):
-                meta = json.loads(meta)
+        # Тільки для пального намагаємося дістати метадані (літри)
+        if ev_type in ("REFILL", "DRAIN"):
+            status[ev_type] = True
+            try:
+                meta = item.get("metadata", {})
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
                 
-            if ev_type == "REFILL":
-                status["REFILL"] = True
                 finish = meta.get("fuelFinishValue", "невідомо")
                 start_val = meta.get("fuelStartValue", "невідомо")
                 volume = meta.get("fuelVolume")
+                
                 if volume is None:
                     if isinstance(finish, (int, float)) and isinstance(start_val, (int, float)):
                         volume = round(abs(finish - start_val), 2)
                     else:
                         volume = "невідомо"
-                refill_volume_str = f"({volume} л)"
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм={volume} л.")
-                
-            elif ev_type == "DRAIN":
-                status["DRAIN"] = True
-                finish = meta.get("fuelFinishValue", "невідомо")
-                start_val = meta.get("fuelStartValue", "невідомо")
-                volume = meta.get("fuelVolume")
-                if volume is None:
-                    if isinstance(finish, (int, float)) and isinstance(start_val, (int, float)):
-                        volume = round(abs(start_val - finish), 2)
-                    else:
-                        volume = "невідомо"
-                drain_volume_str = f"({volume} л)"
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм={volume} л.")
-            
-            elif ev_type == "GEO_IN":
-                status["GEO_IN"] = True
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-            elif ev_type == "GEO_OUT":
-                status["GEO_OUT"] = True
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-            elif ev_type == "OVERSPEED":
-                status["OVERSPEED"] = True
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-            elif ev_type == "SENSOR_VALUE":
-                status["SENSOR"] = True
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-            elif ev_type == "IDLE":
-                status["IDLE"] = True
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
-            elif ev_type == "COMMAND":
-                status["COMMAND"] = True
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
+                        
+                if ev_type == "REFILL":
+                    refill_volume_str = f"({volume} л)"
+                else:
+                    drain_volume_str = f"({volume} л)"
                     
-        except (TypeError, ValueError, json.JSONDecodeError):
-            pass
+                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм={volume} л.")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм прочитати не вдалося.")
 
     report_lines = [
         f"{'✅' if status['REFILL'] else '❌'} Заправка {refill_volume_str}".strip(),
