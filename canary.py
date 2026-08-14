@@ -9,7 +9,7 @@ Canary-моніторинг конвеєра сповіщень.
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
 - ФАЗА 5: Простій (Стоянка 5.5 хв) + Результат команди.
 - ФАЗА 6: Злив (Плавне падіння 750 -> 350 л) + СТАБІЛІЗАЦІЯ (Плато).
-- НЕЗАЛЕЖНА ВІД МЕТАДАНИХ ФІКСАЦІЯ СТАТУСУ.
+- ПАРСЕР ПОДІЙ ЗА ПОЛЕМ "type" (COMMAND_RESULT, IDLE тощо).
 """
 
 import ctypes
@@ -344,31 +344,49 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         if not (match_id or match_dev_name or cfg["device_name"].lower() in item_lower):
             continue
             
-        raw_type = item.get("type", "")
+        # Зчитуємо ключові поля з API
+        raw_type = item.get("type", "").upper()
+        template_name = item.get("templateName") or ""
         
-        # --- РОЗПІЗНАВАННЯ ПОДІЙ ---
+        # --- БРОНЕБІЙНИЙ ПАРСЕР ПОДІЙ ---
         ev_type = None
-        if (cfg["template_refill"] in item_str) or (raw_type == "refill") or ("заправка" in item_lower):
+        
+        # 1. ЗАПРАВКА
+        if raw_type in ("REFILL", "REFIL") or cfg["template_refill"] in template_name or cfg["template_refill"] in item_str:
             ev_type = "REFILL"
-        elif (cfg["template_drain"] in item_str) or (raw_type == "drain") or ("злив" in item_lower):
+            
+        # 2. ЗЛИВ
+        elif raw_type == "DRAIN" or cfg["template_drain"] in template_name or cfg["template_drain"] in item_str:
             ev_type = "DRAIN"
-        elif (cfg["template_geo_in"] in item_str) or (raw_type == "geofenceEnter"):
+            
+        # 3. ВХІД В ГЕОЗОНУ (Type GEOFENCE загальний, тому перевіряємо шаблон)
+        elif cfg["template_geo_in"] in template_name or cfg["template_geo_in"] in item_str or (raw_type == "GEOFENCE" and "вхід" in item_lower):
             ev_type = "GEO_IN"
-        elif (cfg["template_geo_out"] in item_str) or (raw_type == "geofenceExit"):
+            
+        # 4. ВИХІД З ГЕОЗОНИ
+        elif cfg["template_geo_out"] in template_name or cfg["template_geo_out"] in item_str or (raw_type == "GEOFENCE" and "вихід" in item_lower):
             ev_type = "GEO_OUT"
-        elif (cfg["template_overspeed"] in item_str) or (raw_type == "deviceOverspeed") or ("допустиму швидкість" in item_lower):
+            
+        # 5. ШВИДКІСТЬ
+        elif raw_type == "OVERSPEED" or cfg["template_overspeed"] in template_name or cfg["template_overspeed"] in item_str:
             ev_type = "OVERSPEED"
-        elif (cfg["template_sensor"] in item_str) or ("спрацював датчик" in item_lower) or ("значенням 750" in item_lower):
+            
+        # 6. ЗНАЧЕННЯ ДАТЧИКА
+        elif raw_type == "SENSOR_VALUE" or cfg["template_sensor"] in template_name or cfg["template_sensor"] in item_str:
             ev_type = "SENSOR_VALUE"
-        elif (cfg["template_idle"] in item_str) or (raw_type == "deviceIdle") or ("простою" in item_lower):
+            
+        # 7. ПРОСТІЙ
+        elif raw_type == "IDLE" or cfg["template_idle"] in template_name or cfg["template_idle"] in item_str:
             ev_type = "IDLE"
-        elif (cfg["template_command"] in item_str) or (raw_type == "commandResult") or ("commandsentsuccess" in item_lower):
+            
+        # 8. РЕЗУЛЬТАТ КОМАНДИ (Тут template_name = null, тому тип рятує нас!)
+        elif raw_type == "COMMAND_RESULT" or cfg["template_command"] in template_name or cfg["template_command"] in item_str or "commandsentsuccess" in item_lower:
             ev_type = "COMMAND"
             
         if not ev_type:
             continue
 
-        # ОДРАЗУ ставимо статус True, щоб ніяка помилка не скасувала знахідку!
+        # ОДРАЗУ ставимо статус True
         if ev_type == "IDLE":
             status["IDLE"] = True
             log.info(f"✨ ЗНАЙДЕНО ПОДІЮ IDLE (id={event_id})")
@@ -388,7 +406,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             status["COMMAND"] = True
             log.info(f"✨ ЗНАЙДЕНО ПОДІЮ COMMAND (id={event_id})")
 
-        # Тільки для пального намагаємося дістати метадані (літри)
+        # Для пального дістаємо літри
         if ev_type in ("REFILL", "DRAIN"):
             status[ev_type] = True
             try:
