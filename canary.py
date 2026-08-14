@@ -2,14 +2,13 @@
 """
 Canary-моніторинг конвеєра сповіщень.
 
-Алгоритм (ПОВНИЙ КЛОН + ВСІ 7 ТИПІВ ПОДІЙ):
+Алгоритм (ПОВНИЙ КЛОН + ВСІ 8 ТИПІВ ПОДІЙ):
 - ФАЗА 1: Заправка (400 -> 700 л).
 - ФАЗА 2: Геозони (Вихід -> Вхід).
 - ФАЗА 3: Швидкість (Рух 15 км/год).
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
-- ФАЗА 5: Простій (Стоянка 5.5 хвилин).
+- ФАЗА 5: Простій (Стоянка 5.5 хв) + Результат команди (result=CommandSentSuccess).
 - ФАЗА 6: Злив (Поступове падіння до 350 л за 6 точок на швидкості 0).
-- Оновлені тексти сповіщень у Telegram.
 """
 
 import ctypes
@@ -42,6 +41,7 @@ CONFIG = {
     "template_overspeed": "TEST_Notification-Rosenko_Overspeed",
     "template_sensor": "TEST_Notification-Rosenko_SensorValue",
     "template_idle": "TEST_Notification-Rosenko_Idle",
+    "template_command": "Результат команди",  # <--- НОВИЙ ШАБЛОН
     
     "tracker_imei": "123456789011111",
     
@@ -112,7 +112,7 @@ CONFIG = {
 # 1. Відправка тестових даних
 # --------------------------------------------------------------------------
 
-def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0) -> None:
+def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0, result_param: str = None) -> None:
     timestamp = int(time.time())
     fuel_int = int(level) 
     
@@ -131,6 +131,10 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0)
         f"{cfg['fuel_param']}={fuel_int}&"
         f"timestamp={timestamp}"
     )
+    
+    # Якщо передано параметр result (для команди), додаємо його в URL
+    if result_param:
+        url += f"&result={result_param}"
     
     resp = requests.get(url, timeout=cfg["http_timeout_sec"])
     resp.raise_for_status()
@@ -200,7 +204,7 @@ def send_canary_events(cfg: dict) -> datetime:
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
         time.sleep(5)
 
-    log.info("--- ФАЗА 5/6: ПРОСТІЙ (IDLE) ---")
+    log.info("--- ФАЗА 5/6: ПРОСТІЙ ТА КОМАНДА ---")
     log.info("1. Рух для скидання таймера стоянки...")
     current_lat += 0.0002
     current_lon += 0.0002
@@ -209,7 +213,15 @@ def send_canary_events(cfg: dict) -> datetime:
 
     log.info(f"2. Стоянка 5.5 хвилин для тригеру (>5 хв). Відправка {cfg['idle_points_count']} точок кожні {cfg['idle_interval_sec']} сек...")
     for i in range(cfg["idle_points_count"]):
-        _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
+        # На найпершій точці простою також відправляємо команду!
+        if i == 0:
+            log.info("   -> Додаємо параметр result=CommandSentSuccess у першу точку простою")
+            res_val = "CommandSentSuccess"
+        else:
+            res_val = None
+            
+        _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0, result_param=res_val)
+        
         if i < cfg["idle_points_count"] - 1:
             time.sleep(cfg["idle_interval_sec"])
 
@@ -223,7 +235,6 @@ def send_canary_events(cfg: dict) -> datetime:
     
     for i in range(drain_pts):
         current_level = start_drain + drain_step * i
-        # Швидкість = 0, щоб бекенд розпізнав це як реальний злив, а не коливання в русі
         _send_point(cfg, current_level, current_lat, current_lon, speed=0)
         time.sleep(cfg["drain_interval_sec"])
 
@@ -303,7 +314,8 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         "GEO_OUT": False,
         "OVERSPEED": False,
         "SENSOR": False,
-        "IDLE": False
+        "IDLE": False,
+        "COMMAND": False   # <--- НОВИЙ СТАТУС
     }
     refill_volume_str = ""
     drain_volume_str = ""
@@ -325,8 +337,9 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         match_tpl_overspeed = (cfg["template_overspeed"] in item_str)
         match_tpl_sensor = (cfg["template_sensor"] in item_str)
         match_tpl_idle = (cfg["template_idle"] in item_str)
+        match_tpl_command = (cfg["template_command"] in item_str)  # <--- ПЕРЕВІРКА КОМАНДИ
         
-        if not (match_id or match_dev_name or match_tpl_refill or match_tpl_drain or match_tpl_geo_in or match_tpl_geo_out or match_tpl_overspeed or match_tpl_sensor or match_tpl_idle):
+        if not (match_id or match_dev_name or match_tpl_refill or match_tpl_drain or match_tpl_geo_in or match_tpl_geo_out or match_tpl_overspeed or match_tpl_sensor or match_tpl_idle or match_tpl_command):
             continue
             
         ev_type = item.get("type")
@@ -337,10 +350,11 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         elif match_tpl_overspeed: ev_type = "OVERSPEED"
         elif match_tpl_sensor: ev_type = "SENSOR_VALUE"
         elif match_tpl_idle: ev_type = "IDLE"
+        elif match_tpl_command: ev_type = "COMMAND"
         elif ev_type == "geofenceEnter": ev_type = "GEO_IN"
         elif ev_type == "geofenceExit": ev_type = "GEO_OUT"
             
-        if ev_type not in ("REFILL", "DRAIN", "GEO_IN", "GEO_OUT", "OVERSPEED", "SENSOR_VALUE", "IDLE"):
+        if ev_type not in ("REFILL", "DRAIN", "GEO_IN", "GEO_OUT", "OVERSPEED", "SENSOR_VALUE", "IDLE", "COMMAND"):
             continue
 
         created_at_raw = item.get("createdAt")
@@ -396,6 +410,9 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             elif ev_type == "IDLE":
                 status["IDLE"] = True
                 log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
+            elif ev_type == "COMMAND":
+                status["COMMAND"] = True
+                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id})")
                     
         except (TypeError, ValueError, json.JSONDecodeError):
             pass
@@ -407,7 +424,8 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         f"{'✅' if status['GEO_IN'] else '❌'} Вхід у геозону",
         f"{'✅' if status['OVERSPEED'] else '❌'} Швидкість",
         f"{'✅' if status['SENSOR'] else '❌'} Значення датчика",
-        f"{'✅' if status['IDLE'] else '❌'} Простій"
+        f"{'✅' if status['IDLE'] else '❌'} Простій",
+        f"{'✅' if status['COMMAND'] else '❌'} Результат команди"  # <--- ДОДАНО В ТЕЛЕГРАМ
     ]
     report_str = "\n".join(report_lines)
 
