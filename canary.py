@@ -8,7 +8,7 @@ Canary-моніторинг конвеєра сповіщень.
 - ФАЗА 3: Швидкість (Рух 15 км/год).
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
 - ФАЗА 5: Простій (Стоянка 5.5 хв) + Результат команди.
-- ФАЗА 6: Злив (Поступове падіння до 350 л за 6 точок на швидкості 0).
+- ФАЗА 6: Злив (Плавне падіння 750 -> 350 л) + СТАБІЛІЗАЦІЯ (Плато).
 """
 
 import ctypes
@@ -90,8 +90,7 @@ CONFIG = {
     "idle_interval_sec": 30,
 
     # --- ПАРАМЕТРИ ЗЛИВУ (DRAIN) ---
-    "drain_target_value": 350,     
-    "drain_points_count": 6,       
+    "drain_target_value": 350,       
     "drain_interval_sec": 15,      
 
     "initial_wait_sec": 120,   
@@ -226,15 +225,28 @@ def send_canary_events(cfg: dict) -> datetime:
     log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ---")
     start_drain = cfg["sensor_trigger_value"]
     end_drain = cfg["drain_target_value"]
-    drain_pts = cfg["drain_points_count"]
     
-    log.info(f"Стоянка (швидкість 0) + Поступовий злив {start_drain} -> {end_drain} л (точок: {drain_pts}, інтервал: {cfg['drain_interval_sec']}с)...")
-    drain_step = (end_drain - start_drain) / (drain_pts - 1) if drain_pts > 1 else 0
+    # Спеціальна плавна крива зливу (більші кроки спочатку, менші в кінці)
+    drain_levels = [
+        start_drain - 80,  # 670
+        start_drain - 160, # 590
+        start_drain - 240, # 510
+        start_drain - 300, # 450
+        start_drain - 340, # 410
+        start_drain - 370, # 380
+        end_drain          # 350
+    ]
     
-    for i in range(drain_pts):
-        current_level = start_drain + drain_step * i
+    log.info(f"Стоянка (швидкість 0) + Плавний злив {start_drain} -> {end_drain} л (точок: {len(drain_levels)}, інтервал: {cfg['drain_interval_sec']}с)...")
+    
+    for current_level in drain_levels:
         _send_point(cfg, current_level, current_lat, current_lon, speed=0)
         time.sleep(cfg["drain_interval_sec"])
+
+    log.info(f"Стабілізація після зливу (плато на рівні {end_drain} л)...")
+    for i in range(cfg["edge_repeats"]):
+        _send_point(cfg, end_drain, current_lat, current_lon, speed=0)
+        time.sleep(cfg["edge_repeat_interval_sec"])
 
     log.info("Весь профіль повністю відправлено!")
     return start_time
@@ -329,7 +341,6 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         match_id = (item.get("deviceId") == cfg["device_id"])
         match_dev_name = (item.get("deviceName") == cfg["device_name"])
         
-        # Надійна перевірка приналежності події
         if not (match_id or match_dev_name or cfg["device_name"].lower() in item_lower):
             continue
             
@@ -357,7 +368,6 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         if not ev_type:
             continue
 
-        # Підтримка різних варіантів поля часу від API
         created_at_raw = item.get("createdAt") or item.get("eventTime") or item.get("serverTime")
         try:
             created_at = datetime.fromisoformat(created_at_raw)
