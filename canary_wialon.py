@@ -50,7 +50,7 @@ CONFIG = {
     "sat": 12,      
     "hdop": 1,
 
-    # WIALON IPS ПАРАМЕТРИ
+    # --- WIALON IPS ПАРАМЕТРИ ---
     "ingest_host": "213.239.234.94",
     "ingest_port": 5039,
     
@@ -143,13 +143,16 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
     login_pkt = f"#L#{imei};NA\r\n"
     data_pkt = f"#D#{date_str};{time_str};{lat_str};{lat_dir};{lon_str};{lon_dir};{speed};{cfg['bearing']};{cfg['altitude']};{cfg['sat']};{cfg['hdop']};NA;NA;NA;NA;{params_str}\r\n"
     
+    # Записуємо в лог, щоб було видно відправку Wialon
+    log.info(f"Відправка Wialon IPS: {data_pkt.strip()}")
+
     try:
         with socket.create_connection((host, port), timeout=cfg["http_timeout_sec"]) as sock:
             # 1. Авторизація
             sock.sendall(login_pkt.encode('ascii'))
             resp_login = sock.recv(1024).decode('ascii')
             
-            # 2. Відправка даних, якщо авторизація успішна або сервер відповідає #AL#
+            # 2. Відправка даних
             sock.sendall(data_pkt.encode('ascii'))
             resp_data = sock.recv(1024).decode('ascii')
     except Exception as e:
