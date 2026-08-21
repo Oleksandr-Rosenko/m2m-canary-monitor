@@ -513,7 +513,7 @@ def show_popup(cfg: dict, title: str, text: str, is_error: bool) -> None:
 
 def notify_incident(cfg: dict, detail: str) -> None:
     text = (
-        "🔴 Спрацювали не всі сповіщення !\n\n"
+        "🔴 [OsmAnd] Спрацювали не всі сповіщення !\n\n"
         f"{detail}\n\n"
         "Ймовірно завис worker/consumer на беку -- перевір логи."
     )
@@ -524,7 +524,7 @@ def notify_incident(cfg: dict, detail: str) -> None:
 
 
 def notify_recovery(cfg: dict) -> None:
-    text = "🟢 Конвеєр сповіщень відновився, всі типи сповіщень працюють коректно!"
+    text = "🟢 [OsmAnd] Конвеєр сповіщень відновився, всі типи сповіщень працюють коректно!"
     log.info(text)
     show_popup(cfg, "Canary: Відновлено", text, is_error=False)
     send_telegram(cfg, text)
