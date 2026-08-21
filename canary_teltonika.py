@@ -214,7 +214,14 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
             if packet_c12:
                 log.info(f"Teltonika: Sending Codec 12 (Command Response) -> '{result_param}'")
                 sock.sendall(packet_c12)
-                sock.recv(4)
+                try:
+                    # Чекаємо відповідь на Codec 12 всього 3 сек (щоб не вішати скрипт)
+                    sock.settimeout(3.0) 
+                    sock.recv(4)
+                except (socket.timeout, TimeoutError):
+                    log.warning("Teltonika: Сервер промовчав на Codec 12 (це нормально, йдемо далі)")
+                finally:
+                    sock.settimeout(cfg["http_timeout_sec"]) # Повертаємо стандартний таймаут
                 
     except Exception as e:
         log.error(f"TCP Socket Error (Teltonika): {e}")
