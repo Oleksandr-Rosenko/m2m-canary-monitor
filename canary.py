@@ -532,7 +532,7 @@ def notify_recovery(cfg: dict) -> None:
 
 
 def notify_success(cfg: dict, detail: str) -> None:
-    text = f"✅ Всі типи сповіщень працюють коректно !\n\n{detail}"
+    text = f"[OsmAnd]✅ Всі типи сповіщень працюють коректно !\n\n{detail}"
     show_popup(cfg, "Canary: УСПІХ", text, is_error=False)
     send_telegram(cfg, text)
     send_slack(cfg, text)
