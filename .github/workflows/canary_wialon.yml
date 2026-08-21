@@ -3,7 +3,7 @@ name: Canary Monitor (Wialon IPS)
 on:
   schedule:
     # Запускається на 35-й хвилині кожної 3-ї години
-    - cron: '35 */4 * * *'
+    - cron: '05 2,6,10,14,18,22 * * *'
   workflow_dispatch: # Дозволяє ручний запуск
 
 jobs:
