@@ -102,6 +102,7 @@ CONFIG = {
     "desktop_popup": True,   
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
+    "telegram_dm_chat_id": os.getenv("TELEGRAM_DM_CHAT_ID", ""),
     "slack_webhook_url": os.getenv("SLACK_WEBHOOK_URL", ""),
 
     "state_file": Path(os.getenv("CANARY_STATE_FILE", "notification_canary_state.json")),
@@ -128,6 +129,7 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
         f"course={cfg['bearing']}&"
         f"motionState={'true' if speed > 0 else 'false'}&"
         f"valid=true&"
+        f"ignition=true&"
         f"{cfg['fuel_param']}={fuel_int}&"
         f"timestamp={timestamp}"
     )
@@ -488,11 +490,11 @@ def save_state(cfg: dict, state: dict) -> None:
     cfg["state_file"].write_text(json.dumps(state))
 
 
-def send_telegram(cfg: dict, text: str) -> None:
-    if not cfg["telegram_bot_token"] or not cfg["telegram_chat_id"]:
+def send_telegram(token: str, chat_id: str, text: str) -> None:
+    if not token or not chat_id:
         return
-    url = f"https://api.telegram.org/bot{cfg['telegram_bot_token']}/sendMessage"
-    requests.post(url, json={"chat_id": cfg["telegram_chat_id"], "text": text}, timeout=10)
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
 
 
 def send_slack(cfg: dict, text: str) -> None:
@@ -519,7 +521,8 @@ def notify_incident(cfg: dict, detail: str) -> None:
     )
     log.error(text)
     show_popup(cfg, "Canary: ПРОБЛЕМА", text, is_error=True)
-    send_telegram(cfg, text)
+    send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
+    send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
     send_slack(cfg, text)
 
 
@@ -527,14 +530,14 @@ def notify_recovery(cfg: dict) -> None:
     text = "🟢 [OsmAnd] Конвеєр сповіщень відновився, всі типи сповіщень працюють коректно!"
     log.info(text)
     show_popup(cfg, "Canary: Відновлено", text, is_error=False)
-    send_telegram(cfg, text)
+    send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
     send_slack(cfg, text)
 
 
 def notify_success(cfg: dict, detail: str) -> None:
     text = f"[OsmAnd]✅ Всі типи сповіщень працюють коректно !\n\n{detail}"
     show_popup(cfg, "Canary: УСПІХ", text, is_error=False)
-    send_telegram(cfg, text)
+    send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
     send_slack(cfg, text)
 
 
