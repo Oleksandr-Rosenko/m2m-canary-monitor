@@ -79,7 +79,7 @@ CONFIG = {
     "initial_wait_sec": 120,   
     "poll_interval_sec": 30,   
     "max_wait_sec": 900,      
-    "http_timeout_sec": 60,  # ЗБІЛЬШЕНО ТАЙМАУТ ДО 60 СЕКУНД
+    "http_timeout_sec": 60,  
     "desktop_popup": True,   
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -109,6 +109,8 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
     login_pkt = f"#L#{imei};NA\r\n"
     data_pkt = f"#D#{date_str};{time_str};{lat_deg:02d}{lat_min:07.4f};{lat_dir};{lon_deg:03d}{lon_min:07.4f};{lon_dir};{speed};{cfg['bearing']};{cfg['altitude']};{cfg['sat']};{cfg['hdop']};NA;NA;NA;NA;{','.join(params)}\r\n"
     
+    log.info(f"Відправка Wialon IPS: {data_pkt.strip()}")
+    
     # СИСТЕМА ПОВТОРНИХ СПРОБ (3 СПРОБИ)
     max_retries = 3
     for attempt in range(1, max_retries + 1):
@@ -118,7 +120,7 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
                 sock.recv(1024)
                 sock.sendall(data_pkt.encode('ascii'))
                 sock.recv(1024)
-            break  # Якщо все пройшло успішно, виходимо з циклу
+            break  
         except Exception as e:
             if attempt < max_retries:
                 log.warning(f"Спроба {attempt}/{max_retries} не вдалася ({e}). Чекаю 5 сек перед наступною...")
@@ -133,60 +135,80 @@ def send_canary_events(cfg: dict) -> datetime:
     in_lat, in_lon = cfg["geo_in_lat"], cfg["geo_in_lon"]
     out_lat, out_lon = cfg["geo_out_lat"], cfg["geo_out_lon"]
 
+    log.info("--- ФАЗА 1/6: ПАЛЬНЕ (ЗАПРАВКА) ---")
+    log.info(f"Стабілізація старту ({lo} л)")
     for i in range(cfg["edge_repeats"]):
         _send_point(cfg, lo, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
+    log.info(f"Швидка заправка {lo} -> {hi} л")
     step = (hi - lo) / (cfg["num_points"] - 1) if cfg["num_points"] > 1 else 0
     for i in range(cfg["num_points"]):
         _send_point(cfg, lo + step * i, in_lat, in_lon)
         time.sleep(cfg["point_interval_sec"])
 
+    log.info(f"Стабілізація фінішу ({hi} л)")
     for i in range(cfg["edge_repeats"]):
         _send_point(cfg, hi, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
+    log.info("--- ФАЗА 2/6: ГЕОЗОНИ ---")
     for cycle in range(cfg["geo_cycles"]):
+        log.info("Відправка ВИХОДУ (GEO_OUT)")
         for i in range(cfg["geo_points_count"]):
             _send_point(cfg, hi, out_lat, out_lon)
             time.sleep(5)
         time.sleep(cfg["geo_wait_sec"])
+        
+        log.info("Відправка ВХОДУ (GEO_IN)")
         for i in range(cfg["geo_points_count"]):
             _send_point(cfg, hi, in_lat, in_lon)
             time.sleep(5)
         if cycle < cfg["geo_cycles"] - 1:
             time.sleep(cfg["geo_wait_sec"])
 
+    log.info("--- ФАЗА 3/6: ШВИДКІСТЬ (OVERSPEED) ---")
     current_lat, current_lon = in_lat, in_lon
     for cycle in range(2):
+        log.info(f"Рух: швидкість {cfg['overspeed_value']} км/год")
         for i in range(3):
             current_lat += 0.0002; current_lon += 0.0002
             _send_point(cfg, hi, current_lat, current_lon, speed=cfg["overspeed_value"])
             time.sleep(5)
+            
+        log.info("Зупинка: швидкість 0 км/год")
         for i in range(3):
             _send_point(cfg, hi, current_lat, current_lon, speed=0)
             time.sleep(5)
 
+    log.info("--- ФАЗА 4/6: ЗНАЧЕННЯ ДАТЧИКА ---")
+    log.info(f"Відправка рівня пального {cfg['sensor_trigger_value']} л")
     for i in range(3):
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
         time.sleep(5)
 
+    log.info("--- ФАЗА 5/6: ПРОСТІЙ ТА КОМАНДА ---")
+    log.info("Рух для скидання таймера стоянки...")
     current_lat += 0.0002; current_lon += 0.0002
     _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=cfg["overspeed_value"])
     time.sleep(10)
 
+    log.info(f"Стоянка для тригеру простою. Відправка точок...")
     for i in range(cfg["idle_points_count"]):
         res_val = "CommandSentSuccess" if i == 0 else None
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0, result_param=res_val)
         if i < cfg["idle_points_count"] - 1:
             time.sleep(cfg["idle_interval_sec"])
 
+    log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ---")
     start_drain = cfg["sensor_trigger_value"]
     end_drain = cfg["drain_target_value"]
+    log.info(f"Плавний злив {start_drain} -> {end_drain} л...")
     for current_level in [start_drain - 80, start_drain - 160, start_drain - 240, start_drain - 300, start_drain - 340, start_drain - 370, end_drain]:
         _send_point(cfg, current_level, current_lat, current_lon, speed=0)
         time.sleep(cfg["drain_interval_sec"])
 
+    log.info(f"Стабілізація після зливу (плато {end_drain} л)...")
     for i in range(cfg["edge_repeats"]):
         _send_point(cfg, end_drain, current_lat, current_lon, speed=0)
         time.sleep(cfg["edge_repeat_interval_sec"])
@@ -264,7 +286,7 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
         try:
             requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=10)
         except Exception as e:
-            log.warning(f"Не вдалося відправити Telegram повідомлення: {e}")
+            log.warning(f"Не вдалося відправити Telegram: {e}")
 
 def notify_incident(cfg: dict, detail: str) -> None:
     text = f"🔴 [Wialon IPS] Спрацювали не всі сповіщення !\n\n{detail}\n\nЙмовірно завис worker/consumer."
