@@ -28,7 +28,6 @@ CONFIG = {
     "device_id": 9405,
     "device_name": "Test_Notification_o.rosenko",
     
-    # Шаблони
     "template_refill": "TEST_Notification-Rosenko_Refill",
     "template_drain": "TEST_Notification-Rosenko_Drain",
     "template_geo_in": "TEST_Notification-Rosenko_GEOFENCE_IN",
@@ -40,12 +39,10 @@ CONFIG = {
     
     "tracker_imei": "123456789011111",
     
-    # КООРДИНАТИ
     "geo_in_lat": 49.438923,
     "geo_in_lon": 32.085565,
     "geo_out_lat": 49.430000,
     "geo_out_lon": 32.085565,
-
     "altitude": 10,
     "bearing": 210, 
     "sat": 12,      
@@ -80,7 +77,7 @@ CONFIG = {
     "initial_wait_sec": 120,   
     "poll_interval_sec": 30,   
     "max_wait_sec": 900,      
-    "http_timeout_sec": 60,  # ЗБІЛЬШЕНО ТАЙМАУТ
+    "http_timeout_sec": 60,  
     "desktop_popup": True,   
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -133,30 +130,23 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
         crc12 = crc16_arc(data_part12)
         packet_c12 = bytearray(b'\x00\x00\x00\x00') + struct.pack(">I", len(data_part12)) + data_part12 + struct.pack(">I", crc12)
 
-    log.info(f"Teltonika: Fuel (ID201)={int(level)} л, Speed (ID240)={speed} км/год. Sending Binary Codec 8...")
+    log.info(f"Teltonika: Fuel (ID201)={int(level)} л, Speed (ID240)={speed} км/год. Sending Binary...")
 
     try:
         with socket.create_connection((host, port), timeout=cfg["http_timeout_sec"]) as sock:
             imei_b = imei.encode('ascii')
             sock.sendall(struct.pack(">H", len(imei_b)) + imei_b)
             resp = sock.recv(1)
-            if not resp or resp[0] != 1: 
-                log.warning(f"Teltonika Handshake failed! Server returned: {resp}")
-                return
-                
+            if not resp or resp[0] != 1: return
             sock.sendall(packet_c8)
             sock.recv(4) 
-            
             if packet_c12:
-                log.info(f"Teltonika: Sending Codec 12 (Command Response) -> '{result_param}'")
                 sock.sendall(packet_c12)
                 try:
                     sock.settimeout(3.0) 
                     sock.recv(4)
-                except (socket.timeout, TimeoutError): 
-                    log.warning("Teltonika: Сервер промовчав на Codec 12 (це нормально, йдемо далі)")
-                finally: 
-                    sock.settimeout(cfg["http_timeout_sec"])
+                except (socket.timeout, TimeoutError): pass
+                finally: sock.settimeout(cfg["http_timeout_sec"])
     except Exception as e:
         log.error(f"TCP Error (Teltonika): {e}")
         raise
@@ -168,31 +158,26 @@ def send_canary_events(cfg: dict) -> datetime:
     out_lat, out_lon = cfg["geo_out_lat"], cfg["geo_out_lon"]
 
     log.info("--- ФАЗА 1/6: ПАЛЬНЕ (ЗАПРАВКА) ---")
-    log.info(f"Стабілізація старту ({lo} л)")
     for i in range(cfg["edge_repeats"]):
         _send_point(cfg, lo, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
-    log.info(f"Швидка заправка {lo} -> {hi} л")
     step = (hi - lo) / (cfg["num_points"] - 1) if cfg["num_points"] > 1 else 0
     for i in range(cfg["num_points"]):
         _send_point(cfg, lo + step * i, in_lat, in_lon)
         time.sleep(cfg["point_interval_sec"])
 
-    log.info(f"Стабілізація фінішу ({hi} л)")
     for i in range(cfg["edge_repeats"]):
         _send_point(cfg, hi, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
     log.info("--- ФАЗА 2/6: ГЕОЗОНИ ---")
     for cycle in range(cfg["geo_cycles"]):
-        log.info("Відправка ВИХОДУ (GEO_OUT)")
         for i in range(cfg["geo_points_count"]):
             _send_point(cfg, hi, out_lat, out_lon)
             time.sleep(5)
         time.sleep(cfg["geo_wait_sec"])
         
-        log.info("Відправка ВХОДУ (GEO_IN)")
         for i in range(cfg["geo_points_count"]):
             _send_point(cfg, hi, in_lat, in_lon)
             time.sleep(5)
@@ -202,30 +187,24 @@ def send_canary_events(cfg: dict) -> datetime:
     log.info("--- ФАЗА 3/6: ШВИДКІСТЬ (OVERSPEED) ---")
     current_lat, current_lon = in_lat, in_lon
     for cycle in range(2):
-        log.info(f"Рух: швидкість {cfg['overspeed_value']} км/год")
         for i in range(3):
             current_lat += 0.0002; current_lon += 0.0002
             _send_point(cfg, hi, current_lat, current_lon, speed=cfg["overspeed_value"])
             time.sleep(5)
-            
-        log.info("Зупинка: швидкість 0 км/год")
         for i in range(3):
             _send_point(cfg, hi, current_lat, current_lon, speed=0)
             time.sleep(5)
 
     log.info("--- ФАЗА 4/6: ЗНАЧЕННЯ ДАТЧИКА ---")
-    log.info(f"Відправка рівня пального {cfg['sensor_trigger_value']} л")
     for i in range(3):
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
         time.sleep(5)
 
     log.info("--- ФАЗА 5/6: ПРОСТІЙ ТА КОМАНДА ---")
-    log.info("Рух для скидання таймера стоянки...")
     current_lat += 0.0002; current_lon += 0.0002
     _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=cfg["overspeed_value"])
     time.sleep(10)
 
-    log.info(f"Стоянка для тригеру простою. Відправка точок...")
     for i in range(cfg["idle_points_count"]):
         res_val = "CommandSentSuccess" if i == 0 else None
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0, result_param=res_val)
@@ -233,14 +212,11 @@ def send_canary_events(cfg: dict) -> datetime:
             time.sleep(cfg["idle_interval_sec"])
 
     log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ---")
-    start_drain = cfg["sensor_trigger_value"]
-    end_drain = cfg["drain_target_value"]
-    log.info(f"Плавний злив {start_drain} -> {end_drain} л...")
+    start_drain, end_drain = cfg["sensor_trigger_value"], cfg["drain_target_value"]
     for current_level in [start_drain - 80, start_drain - 160, start_drain - 240, start_drain - 300, start_drain - 340, start_drain - 370, end_drain]:
         _send_point(cfg, current_level, current_lat, current_lon, speed=0)
         time.sleep(cfg["drain_interval_sec"])
 
-    log.info(f"Стабілізація після зливу (плато {end_drain} л)...")
     for i in range(cfg["edge_repeats"]):
         _send_point(cfg, end_drain, current_lat, current_lon, speed=0)
         time.sleep(cfg["edge_repeat_interval_sec"])
@@ -277,9 +253,12 @@ def get_existing_event_ids(cfg: dict) -> set:
 def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
     items = fetch_history(cfg).get("items", [])
     status = {"REFILL": False, "DRAIN": False, "GEO_IN": False, "GEO_OUT": False, "OVERSPEED": False, "SENSOR": False, "IDLE": False, "COMMAND": False}
+    refill_volume_str = ""
+    drain_volume_str = ""
 
     for item in items:
-        if item.get("id") in initial_event_ids: continue
+        event_id = item.get("id")
+        if event_id in initial_event_ids: continue
         item_str, item_lower = json.dumps(item, ensure_ascii=False), json.dumps(item, ensure_ascii=False).lower()
         if not (item.get("deviceId") == cfg["device_id"] or item.get("deviceName") == cfg["device_name"]): continue
             
@@ -291,15 +270,41 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         elif cfg["template_geo_in"] in template_name or cfg["template_geo_in"] in item_str or (raw_type == "GEOFENCE" and "вхід" in item_lower): ev_type = "GEO_IN"
         elif cfg["template_geo_out"] in template_name or cfg["template_geo_out"] in item_str or (raw_type == "GEOFENCE" and "вихід" in item_lower): ev_type = "GEO_OUT"
         elif raw_type == "OVERSPEED" or cfg["template_overspeed"] in template_name or cfg["template_overspeed"] in item_str: ev_type = "OVERSPEED"
-        elif raw_type == "SENSOR_VALUE" or cfg["template_sensor"] in template_name or cfg["template_sensor"] in item_str: ev_type = "SENSOR_VALUE"
+        elif raw_type == "SENSOR_VALUE" or cfg["template_sensor"] in template_name or cfg["template_sensor"] in item_str: ev_type = "SENSOR"
         elif raw_type == "IDLE" or cfg["template_idle"] in template_name or cfg["template_idle"] in item_str: ev_type = "IDLE"
         elif raw_type == "COMMAND_RESULT" or cfg["template_command"] in template_name or "commandsentsuccess" in item_lower: ev_type = "COMMAND"
             
         if not ev_type: continue
         status[ev_type] = True
+        
+        # Парсимо літри для пального
+        if ev_type in ("REFILL", "DRAIN"):
+            try:
+                meta = item.get("metadata", {})
+                if isinstance(meta, str): meta = json.loads(meta)
+                volume = meta.get("fuelVolume")
+                if volume is None:
+                    finish = meta.get("fuelFinishValue")
+                    start_val = meta.get("fuelStartValue")
+                    if isinstance(finish, (int, float)) and isinstance(start_val, (int, float)):
+                        volume = round(abs(finish - start_val), 2)
+                if volume is not None:
+                    if ev_type == "REFILL": refill_volume_str = f"({volume} л)"
+                    else: drain_volume_str = f"({volume} л)"
+            except Exception:
+                pass
 
-    report = "\n".join([f"{'✅' if status[k] else '❌'} {k}" for k in status.keys()])
-    return all(status.values()), report
+    report_lines = [
+        f"{'✅' if status['REFILL'] else '❌'} Заправка {refill_volume_str}".strip(),
+        f"{'✅' if status['DRAIN'] else '❌'} Злив {drain_volume_str}".strip(),
+        f"{'✅' if status['GEO_OUT'] else '❌'} Вихід з геозони",
+        f"{'✅' if status['GEO_IN'] else '❌'} Вхід у геозону",
+        f"{'✅' if status['OVERSPEED'] else '❌'} Швидкість",
+        f"{'✅' if status['SENSOR'] else '❌'} Значення датчика",
+        f"{'✅' if status['IDLE'] else '❌'} Простій",
+        f"{'✅' if status['COMMAND'] else '❌'} Результат команди" 
+    ]
+    return all(status.values()), "\n".join(report_lines)
 
 def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
     time.sleep(cfg["initial_wait_sec"])
@@ -317,8 +322,8 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
     if token and chat_id:
         try:
             requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=10)
-        except Exception as e:
-            log.warning(f"Не вдалося відправити Telegram: {e}")
+        except Exception:
+            pass
 
 def notify_incident(cfg: dict, detail: str) -> None:
     text = f"🔴 [Teltonika] Спрацювали не всі сповіщення !\n\n{detail}\n\nЙмовірно завис worker/consumer."
@@ -330,7 +335,7 @@ def notify_recovery(cfg: dict) -> None:
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
 
 def notify_success(cfg: dict, detail: str) -> None:
-    text = f"✅ [Teltonika] Всі типи сповіщень працюють !\n\n{detail}"
+    text = f"✅ [Teltonika] Всі типи сповіщень працюють коректно !\n\n{detail}"
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
 
 def main() -> int:
@@ -340,7 +345,6 @@ def main() -> int:
     try:
         start = send_canary_events(cfg)
     except Exception as e:
-        log.exception("Не вдалось відправити canary-подію (Teltonika)")
         notify_incident(cfg, f"Помилка відправки тестових подій TCP: {e}")
         return 1
 
