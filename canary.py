@@ -2,14 +2,14 @@
 """
 Canary-моніторинг конвеєра сповіщень.
 
-Алгоритм (ПОВНИЙ КЛОН + ВСІ 8 ТИПІВ ПОДІЙ + БРОНЕБІЙНИЙ ПАРСЕР):
+Алгоритм:
 - ФАЗА 1: Заправка (400 -> 700 л).
 - ФАЗА 2: Геозони (Вихід -> Вхід).
 - ФАЗА 3: Швидкість (Рух 15 км/год).
 - ФАЗА 4: Датчик (Пальне 750 л для тригеру 701-801).
 - ФАЗА 5: Простій (Стоянка 5.5 хв) + Результат команди.
 - ФАЗА 6: Злив (Плавне падіння 750 -> 350 л) + СТАБІЛІЗАЦІЯ (Плато).
-- ПАРСЕР ПОДІЙ ЗА ПОЛЕМ "type" (COMMAND_RESULT, IDLE тощо).
+- Захист мережі: Retry + Reconnect на рівні HTTP Session та _send_point.
 """
 
 import ctypes
@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("canary")
@@ -68,14 +70,14 @@ CONFIG = {
     "history_path": "/notification/history",
     "history_query": {"page": 1, "per_page": 50},
 
-    # --- ПАРАМЕТРИ ПАЛЬНОГО ---
+    # --- ПАРАМЕТРИ ПАЛЬНОГО (м'якший таймінг для уникання rate-limit) ---
     "fuel_param": "fuel",
     "start_level_l": 400,
     "end_level_l": 700,
     "num_points": 15,                 
-    "point_interval_sec": 5,          
+    "point_interval_sec": 8,          # було 5
     "edge_repeats": 3,                
-    "edge_repeat_interval_sec": 5,    
+    "edge_repeat_interval_sec": 8,    # було 5
 
     # --- ПАРАМЕТРИ ГЕОЗОН ---
     "geo_cycles": 2,          
@@ -110,7 +112,27 @@ CONFIG = {
 
 
 # --------------------------------------------------------------------------
-# 1. Відправка тестових даних
+# Пул сесій з надійними повторними спробами
+# --------------------------------------------------------------------------
+
+def get_resilient_session(retries: int = 3, backoff: float = 1.0) -> requests.Session:
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=retries,
+        backoff_factor=backoff,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+GLOBAL_SESSION = get_resilient_session()
+
+
+# --------------------------------------------------------------------------
+# 1. Відправка тестових даних з реконектами
 # --------------------------------------------------------------------------
 
 def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0, result_param: str = None) -> None:
@@ -137,8 +159,20 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
     if result_param:
         url += f"&result={result_param}"
     
-    resp = requests.get(url, timeout=cfg["http_timeout_sec"])
-    resp.raise_for_status()
+    max_connection_attempts = 4
+    for attempt in range(1, max_connection_attempts + 1):
+        try:
+            resp = GLOBAL_SESSION.get(url, timeout=cfg["http_timeout_sec"])
+            resp.raise_for_status()
+            return
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            if attempt == max_connection_attempts:
+                log.error("Критичний збій мережі після %d спроб: %s", max_connection_attempts, exc)
+                raise
+            sleep_time = 5 * attempt
+            log.warning("Тимчасова відмова з'єднання (спроба %d/%d). Пауза %d с: %s", 
+                        attempt, max_connection_attempts, sleep_time, exc)
+            time.sleep(sleep_time)
 
 
 def send_canary_events(cfg: dict) -> datetime:
@@ -150,7 +184,7 @@ def send_canary_events(cfg: dict) -> datetime:
 
     log.info("--- ФАЗА 1/6: ПАЛЬНЕ (ЗАПРАВКА) ---")
     log.info("Стабілізація старту (%s л)", lo)
-    for i in range(cfg["edge_repeats"]):
+    for _ in range(cfg["edge_repeats"]):
         _send_point(cfg, lo, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
@@ -162,23 +196,23 @@ def send_canary_events(cfg: dict) -> datetime:
         time.sleep(cfg["point_interval_sec"])
 
     log.info("Стабілізація фінішу (%s л)", hi)
-    for i in range(cfg["edge_repeats"]):
+    for _ in range(cfg["edge_repeats"]):
         _send_point(cfg, hi, in_lat, in_lon)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
     log.info("--- ФАЗА 2/6: ГЕОЗОНИ ---")
     for cycle in range(cfg["geo_cycles"]):
         log.info("Відправка ВИХОДУ (GEO_OUT)")
-        for i in range(cfg["geo_points_count"]):
+        for _ in range(cfg["geo_points_count"]):
             _send_point(cfg, hi, out_lat, out_lon)
-            time.sleep(5)
+            time.sleep(8)
                 
         time.sleep(cfg["geo_wait_sec"])
 
         log.info("Відправка ВХОДУ (GEO_IN)")
-        for i in range(cfg["geo_points_count"]):
+        for _ in range(cfg["geo_points_count"]):
             _send_point(cfg, hi, in_lat, in_lon)
-            time.sleep(5)
+            time.sleep(8)
                 
         if cycle < cfg["geo_cycles"] - 1:
             time.sleep(cfg["geo_wait_sec"])
@@ -186,49 +220,41 @@ def send_canary_events(cfg: dict) -> datetime:
     log.info("--- ФАЗА 3/6: ШВИДКІСТЬ (OVERSPEED) ---")
     current_lat, current_lon = in_lat, in_lon
     
-    for cycle in range(2):
-        log.info(f"Рух: швидкість {cfg['overspeed_value']} км/год")
-        for i in range(3):
+    for _ in range(2):
+        log.info("Рух: швидкість %s км/год", cfg['overspeed_value'])
+        for _ in range(3):
             current_lat += 0.0002 
             current_lon += 0.0002
             _send_point(cfg, hi, current_lat, current_lon, speed=cfg["overspeed_value"])
-            time.sleep(5)
+            time.sleep(8)
             
         log.info("Зупинка: швидкість 0 км/год")
-        for i in range(3):
+        for _ in range(3):
             _send_point(cfg, hi, current_lat, current_lon, speed=0)
-            time.sleep(5)
+            time.sleep(8)
 
     log.info("--- ФАЗА 4/6: ЗНАЧЕННЯ ДАТЧИКА ---")
-    log.info(f"Відправка рівня пального {cfg['sensor_trigger_value']} л (Тригер 701-801)")
-    for i in range(3):
+    log.info("Відправка рівня пального %s л (Тригер 701-801)", cfg['sensor_trigger_value'])
+    for _ in range(3):
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0)
-        time.sleep(5)
+        time.sleep(8)
 
     log.info("--- ФАЗА 5/6: ПРОСТІЙ ТА КОМАНДА ---")
-    log.info("1. Рух для скидання таймера стоянки...")
     current_lat += 0.0002
     current_lon += 0.0002
     _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=cfg["overspeed_value"])
     time.sleep(10)
 
-    log.info(f"2. Стоянка 5.5 хвилин для тригеру (>5 хв). Відправка {cfg['idle_points_count']} точок кожні {cfg['idle_interval_sec']} сек...")
+    log.info("Стоянка 5.5 хвилин для тригеру (>5 хв). Точок: %s...", cfg['idle_points_count'])
     for i in range(cfg["idle_points_count"]):
-        if i == 0:
-            log.info("   -> Додаємо параметр result=CommandSentSuccess у першу точку простою")
-            res_val = "CommandSentSuccess"
-        else:
-            res_val = None
-            
+        res_val = "CommandSentSuccess" if i == 0 else None
         _send_point(cfg, cfg["sensor_trigger_value"], current_lat, current_lon, speed=0, result_param=res_val)
-        
         if i < cfg["idle_points_count"] - 1:
             time.sleep(cfg["idle_interval_sec"])
 
     log.info("--- ФАЗА 6/6: ЗЛИВ (DRAIN) ---")
     start_drain = cfg["sensor_trigger_value"]
     end_drain = cfg["drain_target_value"]
-    
     drain_levels = [
         start_drain - 80,  
         start_drain - 160, 
@@ -239,14 +265,11 @@ def send_canary_events(cfg: dict) -> datetime:
         end_drain          
     ]
     
-    log.info(f"Стоянка (швидкість 0) + Плавний злив {start_drain} -> {end_drain} л (точок: {len(drain_levels)}, інтервал: {cfg['drain_interval_sec']}с)...")
-    
     for current_level in drain_levels:
         _send_point(cfg, current_level, current_lat, current_lon, speed=0)
         time.sleep(cfg["drain_interval_sec"])
 
-    log.info(f"Стабілізація після зливу (плато на рівні {end_drain} л)...")
-    for i in range(cfg["edge_repeats"]):
+    for _ in range(cfg["edge_repeats"]):
         _send_point(cfg, end_drain, current_lat, current_lon, speed=0)
         time.sleep(cfg["edge_repeat_interval_sec"])
 
@@ -260,28 +283,22 @@ def send_canary_events(cfg: dict) -> datetime:
 
 def refresh_api_token(cfg: dict) -> None:
     if not cfg["api_email"] or not cfg["api_password"]:
-        raise ValueError("Відсутні облікові дані (M2M_EMAIL, M2M_PASSWORD) для автооновлення токена.")
+        raise ValueError("Відсутні облікові дані для автооновлення токена.")
 
     url = f"{cfg['api_base_url']}{cfg['login_path']}"
-    payload = {
-        "email": cfg["api_email"],
-        "password": cfg["api_password"]
-    }
+    payload = {"email": cfg["api_email"], "password": cfg["api_password"]}
     
-    log.info("Спроба отримання нового API-токена (авторизація)...")
-    resp = requests.post(url, json=payload, timeout=cfg["http_timeout_sec"])
-    
+    resp = GLOBAL_SESSION.post(url, json=payload, timeout=cfg["http_timeout_sec"])
     if resp.status_code != 200:
-        raise PermissionError(f"Помилка авторизації! Статус: {resp.status_code}. Перевірте логін та пароль.")
+        raise PermissionError(f"Помилка авторизації: {resp.status_code}")
         
     data = resp.json()
     new_token = data.get("token")
-    
     if not new_token:
         raise ValueError("Токен не знайдено у відповіді сервера.")
 
     cfg["api_token"] = new_token
-    log.info("API-токен успішно отримано/оновлено!")
+    log.info("API-токен оновлено!")
 
 
 def fetch_history(cfg: dict) -> dict:
@@ -291,13 +308,11 @@ def fetch_history(cfg: dict) -> dict:
     url = f"{cfg['api_base_url']}{cfg['history_path']}"
     headers = {"Authorization": f"Bearer {cfg['api_token']}"}
     
-    resp = requests.get(url, headers=headers, params=cfg["history_query"], timeout=cfg["http_timeout_sec"])
-    
+    resp = GLOBAL_SESSION.get(url, headers=headers, params=cfg["history_query"], timeout=cfg["http_timeout_sec"])
     if resp.status_code == 401:
-        log.warning("API-токен прострочений (401). Виконую автооновлення...")
         refresh_api_token(cfg)
         headers = {"Authorization": f"Bearer {cfg['api_token']}"}
-        resp = requests.get(url, headers=headers, params=cfg["history_query"], timeout=cfg["http_timeout_sec"])
+        resp = GLOBAL_SESSION.get(url, headers=headers, params=cfg["history_query"], timeout=cfg["http_timeout_sec"])
         
     resp.raise_for_status()
     return resp.json()
@@ -307,27 +322,18 @@ def get_existing_event_ids(cfg: dict) -> set:
     try:
         data = fetch_history(cfg)
         return {item.get("id") for item in data.get("items", []) if item.get("id") is not None}
-    except PermissionError as e:
-        raise e
     except Exception as e:
-        log.warning(f"Не вдалося отримати початковий стан історії: {e}")
+        log.warning("Не вдалося отримати початковий стан історії: %s", e)
         return set()
 
 
 def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
-    log.info("Перевіряю історію: %s%s", cfg["api_base_url"], cfg["history_path"])
     data = fetch_history(cfg)
     items = data.get("items", [])
 
     status = {
-        "REFILL": False,
-        "DRAIN": False,
-        "GEO_IN": False,
-        "GEO_OUT": False,
-        "OVERSPEED": False,
-        "SENSOR": False,
-        "IDLE": False,
-        "COMMAND": False
+        "REFILL": False, "DRAIN": False, "GEO_IN": False, "GEO_OUT": False,
+        "OVERSPEED": False, "SENSOR": False, "IDLE": False, "COMMAND": False
     }
     refill_volume_str = ""
     drain_volume_str = ""
@@ -346,94 +352,52 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         if not (match_id or match_dev_name or cfg["device_name"].lower() in item_lower):
             continue
             
-        # Зчитуємо ключові поля з API
         raw_type = item.get("type", "").upper()
         template_name = item.get("templateName") or ""
-        
-        # --- БРОНЕБІЙНИЙ ПАРСЕР ПОДІЙ ---
         ev_type = None
         
-        # 1. ЗАПРАВКА
         if raw_type in ("REFILL", "REFIL") or cfg["template_refill"] in template_name or cfg["template_refill"] in item_str:
             ev_type = "REFILL"
-            
-        # 2. ЗЛИВ
         elif raw_type == "DRAIN" or cfg["template_drain"] in template_name or cfg["template_drain"] in item_str:
             ev_type = "DRAIN"
-            
-        # 3. ВХІД В ГЕОЗОНУ (Type GEOFENCE загальний, тому перевіряємо шаблон)
         elif cfg["template_geo_in"] in template_name or cfg["template_geo_in"] in item_str or (raw_type == "GEOFENCE" and "вхід" in item_lower):
             ev_type = "GEO_IN"
-            
-        # 4. ВИХІД З ГЕОЗОНИ
         elif cfg["template_geo_out"] in template_name or cfg["template_geo_out"] in item_str or (raw_type == "GEOFENCE" and "вихід" in item_lower):
             ev_type = "GEO_OUT"
-            
-        # 5. ШВИДКІСТЬ
         elif raw_type == "OVERSPEED" or cfg["template_overspeed"] in template_name or cfg["template_overspeed"] in item_str:
             ev_type = "OVERSPEED"
-            
-        # 6. ЗНАЧЕННЯ ДАТЧИКА
         elif raw_type == "SENSOR_VALUE" or cfg["template_sensor"] in template_name or cfg["template_sensor"] in item_str:
-            ev_type = "SENSOR_VALUE"
-            
-        # 7. ПРОСТІЙ
+            ev_type = "SENSOR"
         elif raw_type == "IDLE" or cfg["template_idle"] in template_name or cfg["template_idle"] in item_str:
             ev_type = "IDLE"
-            
-        # 8. РЕЗУЛЬТАТ КОМАНДИ (Тут template_name = null, тому тип рятує нас!)
-        elif raw_type == "COMMAND_RESULT" or cfg["template_command"] in template_name or cfg["template_command"] in item_str or "commandsentsuccess" in item_lower:
+        elif raw_type == "COMMAND_RESULT" or cfg["template_command"] in template_name or "commandsentsuccess" in item_lower:
             ev_type = "COMMAND"
             
         if not ev_type:
             continue
 
-        # ОДРАЗУ ставимо статус True
-        if ev_type == "IDLE":
-            status["IDLE"] = True
-            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ IDLE (id={event_id})")
-        elif ev_type == "GEO_IN":
-            status["GEO_IN"] = True
-            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ GEO_IN (id={event_id})")
-        elif ev_type == "GEO_OUT":
-            status["GEO_OUT"] = True
-            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ GEO_OUT (id={event_id})")
-        elif ev_type == "OVERSPEED":
-            status["OVERSPEED"] = True
-            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ OVERSPEED (id={event_id})")
-        elif ev_type == "SENSOR_VALUE":
-            status["SENSOR"] = True
-            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ SENSOR_VALUE (id={event_id})")
-        elif ev_type == "COMMAND":
-            status["COMMAND"] = True
-            log.info(f"✨ ЗНАЙДЕНО ПОДІЮ COMMAND (id={event_id})")
+        status[ev_type] = True
 
-        # Для пального дістаємо літри
         if ev_type in ("REFILL", "DRAIN"):
-            status[ev_type] = True
             try:
                 meta = item.get("metadata", {})
                 if isinstance(meta, str):
                     meta = json.loads(meta)
                 
-                finish = meta.get("fuelFinishValue", "невідомо")
-                start_val = meta.get("fuelStartValue", "невідомо")
                 volume = meta.get("fuelVolume")
-                
                 if volume is None:
+                    finish = meta.get("fuelFinishValue")
+                    start_val = meta.get("fuelStartValue")
                     if isinstance(finish, (int, float)) and isinstance(start_val, (int, float)):
                         volume = round(abs(finish - start_val), 2)
-                    else:
-                        volume = "невідомо"
                         
-                if ev_type == "REFILL":
-                    refill_volume_str = f"({volume} л)"
-                else:
-                    drain_volume_str = f"({volume} л)"
-                    
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм={volume} л.")
-            except (TypeError, ValueError, json.JSONDecodeError):
-                log.info(f"✨ ЗНАЙДЕНО ПОДІЮ {ev_type} (id={event_id}): об'єм прочитати не вдалося.")
+                if volume is not None:
+                    if ev_type == "REFILL":
+                        refill_volume_str = f"({volume} л)"
+                    else:
+                        drain_volume_str = f"({volume} л)"
+            except Exception:
+                pass
 
     report_lines = [
         f"{'✅' if status['REFILL'] else '❌'} Заправка {refill_volume_str}".strip(),
@@ -445,39 +409,23 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         f"{'✅' if status['IDLE'] else '❌'} Простій",
         f"{'✅' if status['COMMAND'] else '❌'} Результат команди" 
     ]
-    report_str = "\n".join(report_lines)
-
-    if all(status.values()):
-        return True, report_str
-    
-    return False, report_str
+    return all(status.values()), "\n".join(report_lines)
 
 
 def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
-    wait_mins = cfg["initial_wait_sec"] // 60
-    log.info(f"⏳ Даємо бекенду {wait_mins} хвилин на обробку даних перед перевіркою історії...")
     time.sleep(cfg["initial_wait_sec"])
-    
     deadline = time.monotonic() + cfg["max_wait_sec"]
-    attempt = 0
     while True:
-        attempt += 1
-        elapsed = cfg["max_wait_sec"] - max(0, deadline - time.monotonic())
-        log.info("Перевірка #%d (минуло ~%.0f сек з max %d сек)...", attempt, elapsed, cfg["max_wait_sec"])
-        
         ok, detail = check_events_in_history(cfg, start_time, initial_event_ids)
-        
         if ok:
             return True, detail
-            
         if time.monotonic() >= deadline:
             return False, f"Таймаут ({cfg['max_wait_sec']} сек).\n\n{detail}"
-            
         time.sleep(cfg["poll_interval_sec"])
 
 
 # --------------------------------------------------------------------------
-# 3. Алертинг з дедуплікацією
+# 3. Алертинг
 # --------------------------------------------------------------------------
 
 def load_state(cfg: dict) -> dict:
@@ -494,13 +442,19 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
     if not token or not chat_id:
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
-    requests.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    try:
+        GLOBAL_SESSION.post(url, json={"chat_id": chat_id, "text": text}, timeout=10)
+    except Exception as exc:
+        log.warning("Не вдалося відправити повідомлення в Telegram: %s", exc)
 
 
 def send_slack(cfg: dict, text: str) -> None:
     if not cfg["slack_webhook_url"]:
         return
-    requests.post(cfg["slack_webhook_url"], json={"text": text}, timeout=10)
+    try:
+        GLOBAL_SESSION.post(cfg["slack_webhook_url"], json={"text": text}, timeout=10)
+    except Exception:
+        pass
 
 
 def show_popup(cfg: dict, title: str, text: str, is_error: bool) -> None:
@@ -514,11 +468,7 @@ def show_popup(cfg: dict, title: str, text: str, is_error: bool) -> None:
 
 
 def notify_incident(cfg: dict, detail: str) -> None:
-    text = (
-        "🔴 [OsmAnd] Спрацювали не всі сповіщення !\n\n"
-        f"{detail}\n\n"
-        "Ймовірно завис worker/consumer на беку -- перевір логи."
-    )
+    text = f"🔴 [OsmAnd] Спрацювали не всі сповіщення !\n\n{detail}\n\nЙмовірно завис worker/consumer на беку -- перевір логи."
     log.error(text)
     show_popup(cfg, "Canary: ПРОБЛЕМА", text, is_error=True)
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
@@ -531,13 +481,15 @@ def notify_recovery(cfg: dict) -> None:
     log.info(text)
     show_popup(cfg, "Canary: Відновлено", text, is_error=False)
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
+    send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
     send_slack(cfg, text)
 
 
 def notify_success(cfg: dict, detail: str) -> None:
-    text = f"[OsmAnd]✅ Всі типи сповіщень працюють коректно !\n\n{detail}"
+    text = f"✅ [OsmAnd] Всі типи сповіщень працюють коректно !\n\n{detail}"
     show_popup(cfg, "Canary: УСПІХ", text, is_error=False)
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
+    send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
     send_slack(cfg, text)
 
 
@@ -545,73 +497,39 @@ def notify_success(cfg: dict, detail: str) -> None:
 # main
 # --------------------------------------------------------------------------
 
-def inspect_mode(cfg: dict) -> int:
-    try:
-        data = fetch_history(cfg)
-        items = data.get("items", [])
-        print(f"Всього записів на сторінці: {len(items)}")
-        for item in items[:10]:
-            print(f"  id={item.get('id')} type={item.get('type')} deviceId={item.get('deviceId')} "
-                  f"deviceName={item.get('deviceName')!r} createdAt={item.get('createdAt')}")
-        return 0
-    except Exception as e:
-        log.error(f"Помилка під час інспекції: {e}")
-        return 1
-
-
 def main() -> int:
     cfg = CONFIG
 
-    if "--inspect" in sys.argv:
-        return inspect_mode(cfg)
-
     if not cfg["api_token"] and not (cfg["api_email"] and cfg["api_password"]):
-        log.error("🚨 Не задано облікових даних! Вкажіть M2M_API_TOKEN або пару M2M_EMAIL та M2M_PASSWORD.")
+        log.error("🚨 Не задано облікових даних API.")
         return 1
 
     state = load_state(cfg)
-
-    log.info("Збираю поточний стан історії для фільтрації старих подій...")
     try:
         initial_event_ids = get_existing_event_ids(cfg)
-        log.info("Знайдено старих подій в історії: %d (вони будуть ігноруватись)", len(initial_event_ids))
-    except PermissionError as e:
-        log.error(f"🚨 ПОМИЛКА АВТОРИЗАЦІЇ: {e}")
-        return 1
-    except ValueError as e:
-        log.error(f"🚨 ПОМИЛКА КОНФІГУРАЦІЇ: {e}")
+    except Exception as e:
+        log.error("Помилка конфігурації/авторизації: %s", e)
         return 1
 
     try:
         start_time = send_canary_events(cfg)
     except Exception as e:
-        log.exception("Не вдалось відправити canary-подію")
         notify_incident(cfg, f"Помилка відправки тестових подій: {e}")
         return 1
 
-    log.info("Очікую появу подій (перевірятиму до %d хв)...", cfg["max_wait_sec"] // 60)
-
     try:
         ok, detail = wait_for_events(cfg, start_time, initial_event_ids)
-    except PermissionError as e:
-        log.error(f"🚨 ПОМИЛКА АВТОРИЗАЦІЇ ПІД ЧАС ПЕРЕВІРКИ: {e}")
-        notify_incident(cfg, "Помилка авторизації під час очікування. Перевірте облікові дані.")
-        return 1
     except Exception as e:
-        log.exception("Не вдалось перевірити історію через API")
         notify_incident(cfg, f"Помилка запиту до API історії:\n{e}")
         return 1
 
     if ok:
-        log.info("Все добре: %s", detail)
         if state.get("incident_open"):
             notify_recovery(cfg)
         else:
             notify_success(cfg, detail)
-            
         state["incident_open"] = False
     else:
-        log.warning("Проблема: %s", detail)
         if not state.get("incident_open"):
             notify_incident(cfg, detail)
         state["incident_open"] = True
