@@ -1,0 +1,38 @@
+name: Canary Monitor (Teltonika Double Refill & Drain)
+
+on:
+  schedule:
+    # Запускається на 0-й хвилині кожної 3-ї години (03:00, 06:00, 09:00...)
+    - cron: '0 3,6,9,12,15,18,21,0 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-canary-teltonika-double:
+    runs-on: ubuntu-latest
+    env:
+      TZ: Europe/Kyiv
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run Canary Script (Teltonika Double)
+        env:
+          M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
+          M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
+          M2M_API_TOKEN: ${{ secrets.M2M_API_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
+        run: python canary_teltonika_double.py
