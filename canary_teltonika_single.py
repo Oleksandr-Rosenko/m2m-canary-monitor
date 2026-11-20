@@ -305,17 +305,22 @@ def fetch_history(cfg: dict) -> dict:
 
 def get_existing_event_ids(cfg: dict) -> set:
     try: 
-        return {item.get("id") for item in fetch_history(cfg).get("items", []) if item.get("id") is not None}
+        res = fetch_history(cfg)
+        items = res.get("items") or res.get("data") or []
+        return {item.get("id") for item in items if isinstance(item, dict) and item.get("id") is not None}
     except Exception: 
         return set()
 
 
 def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
-    items = fetch_history(cfg).get("items", [])
+    res = fetch_history(cfg)
+    items = res.get("items") or res.get("data") or []
     refills_found = []
     drains_found = []
 
     for item in items:
+        if not isinstance(item, dict):
+            continue
         event_id = item.get("id")
         if event_id in initial_event_ids: 
             continue
@@ -323,7 +328,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         item_str = json.dumps(item, ensure_ascii=False)
         item_lower = item_str.lower()
         dev_id = item.get("deviceId")
-        dev_name = item.get("deviceName")
+        dev_name = item.get("deviceName") or ""
         
         target_name = cfg.get("device_name", "")
         target_id = cfg.get("device_id")
@@ -331,7 +336,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         matched = False
         if target_id and dev_id == target_id:
             matched = True
-        elif target_name and (dev_name == target_name or target_name.lower() in item_lower):
+        elif target_name and (target_name.lower() in dev_name.lower() or target_name.lower() in item_lower):
             matched = True
             
         if not matched:
@@ -363,13 +368,13 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         if (
             target_refill in template_name.lower() 
             or target_refill in item_lower 
-            or (raw_type in ("REFILL", "REFIL") and "single" in (dev_name or "").lower())
+            or raw_type in ("REFILL", "REFIL")
         ):
             refills_found.append(f"Заправка{vol_str}")
         elif (
             target_drain in template_name.lower() 
             or target_drain in item_lower 
-            or (raw_type == "DRAIN" and "single" in (dev_name or "").lower())
+            or raw_type == "DRAIN"
         ):
             drains_found.append(f"Злив{vol_drain_str}")
 
@@ -383,7 +388,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         report_lines.append("❌ Заправка")
 
     if ok_drain:
-        report_lines.append(f"✅ Злив{drains_found[0]}")
+        report_lines.append(f"✅ {drains_found[0]}")
     else:
         report_lines.append("❌ Злив")
 

@@ -318,13 +318,13 @@ def fetch_history(cfg: dict) -> dict:
 
 def get_existing_event_ids(cfg: dict) -> set:
     data = fetch_history(cfg)
-    items = data.get("data", []) if isinstance(data, dict) else []
+    items = data.get("items") or data.get("data") or []
     return {item["id"] for item in items if isinstance(item, dict) and "id" in item}
 
 
 def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
     data = fetch_history(cfg)
-    items = data.get("data", []) if isinstance(data, dict) else []
+    items = data.get("items") or data.get("data") or []
     
     target_refill = cfg["template_refill"].lower()
     target_drain = cfg["template_drain"].lower()
