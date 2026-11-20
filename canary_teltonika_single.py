@@ -5,6 +5,12 @@ Canary-моніторинг конвеєра сповіщень M2M.
 ПРОТОКОЛ: TELTONIKA (Codec 8)
 Об'єкт: Refill_Drain_UNIT (IMEI: 12345678901234567890)
 Сервер: 95.217.119.27:5027
+
+Вимоги детектора поїздок M2M:
+- Мін. час стоянки: 300 с (стоянки зроблені по 12-15 хв!)
+- Мін. час поїздки: 60 с (поїздки по 2 хв!)
+- Мін. дистанція поїздки: 100 м (дистанція 600-800 м!)
+- Мін. швидкість: 1 км/год (швидкість 30-36 км/год!)
 """
 
 import json
@@ -29,7 +35,7 @@ log = logging.getLogger("canary_teltonika_single")
 # --------------------------------------------------------------------------
 
 CONFIG = {
-    "device_id": None,  # Визначається автоматично або через назву об'єкта
+    "device_id": None,
     "device_name": "Refill_Drain_UNIT",
     "tracker_imei": "12345678901234567890",
     
@@ -53,22 +59,9 @@ CONFIG = {
     "history_path": "/notification/history",
     "history_query": {"page": 1, "per_page": 50},
 
-    # Параметри реалістичного профілю пального (1:1 л по ID 201)
-    "baseline_level_l": 150,     # Рівень перед заправкою
-    "refill_target_l": 450,      # Рівень після заправки (+300 л)
-    "drain_target_l": 200,       # Рівень після зливу (-250 л)
-    
-    # Таймінги та кроки точок
-    "point_interval_sec": 6,     # Інтервал між точками
-    "baseline_points": 3,        # Точок спокою перед подією
-    "ramp_points": 6,            # Точок для плавного зростання/падіння
-    "plateau_points": 3,         # Точок стабілізації після події
-    "trip_points": 2,            # Точок поїздки для закриття стоянки
-    "trip_speed": 28,            # Швидкість руху для закриття стоянки (км/год)
-
-    "initial_wait_sec": 30,      # Пауза перед першим опитуванням API
-    "poll_interval_sec": 15,     # Інтервал опитування API
-    "max_wait_sec": 300,         # Максимальний таймаут очікування сповіщень
+    "initial_wait_sec": 30,
+    "poll_interval_sec": 15,
+    "max_wait_sec": 300,
     "http_timeout_sec": 30,  
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -109,12 +102,14 @@ def crc16_arc(data: bytes) -> int:
     return crc
 
 
-def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0, ignition: int = 0) -> None:
-    host, port, imei = cfg["ingest_host"], cfg["ingest_port"], cfg["tracker_imei"]
-    timestamp_ms = int(time.time() * 1000)
-    
-    # Codec 8 AVL Record
-    # timestamp(8), priority(1), lon(4), lat(4), altitude(2), angle(2), sat(1), speed(2)
+def build_codec8_packet(cfg: dict, pt: dict) -> bytearray:
+    speed = int(pt["speed"])
+    ignition = int(pt["ignition"])
+    level = int(pt["level"])
+    lat = float(pt["lat"])
+    lon = float(pt["lon"])
+    timestamp_ms = int(pt["timestamp_ms"])
+
     avl_data = struct.pack(
         ">Q b i i h h B h", 
         timestamp_ms, 0, 
@@ -122,133 +117,163 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
         cfg["altitude"], cfg["bearing"], cfg["sat"], speed
     )
     
-    # IO Data
     io_data = bytearray()
     io_data.append(0)  # Event IO ID
-    io_data.append(3)  # Total IO elements: 3 (Movement, Ignition, Fuel)
+    io_data.append(3)  # Total IO elements: 3
     
-    # 1-byte IOs: 2 elements
-    io_data.append(2)  
-    io_data.append(240)  # Movement (IO ID 240)
+    # 1-byte IOs: Movement (240) and Ignition (239)
+    io_data.append(2)
+    io_data.append(240)
     io_data.append(1 if speed > 0 else 0)
-    io_data.append(239)  # Ignition (IO ID 239)
+    io_data.append(239)
     io_data.append(1 if ignition else 0)
     
-    # 2-byte IOs: 1 element
-    io_data.append(1)  
-    io_data.append(201)  # Fuel level (IO ID 201, LLS Fuel 1)
-    io_data.extend(struct.pack(">h", int(level)))
+    # 2-byte IOs: Fuel level (201)
+    io_data.append(1)
+    io_data.append(201)
+    io_data.extend(struct.pack(">h", level))
     
-    # 4-byte and 8-byte IOs: 0 elements
+    # 4-byte and 8-byte IOs: 0
     io_data.append(0)
     io_data.append(0)
     
-    # Codec 8 Part
     data_part8 = bytearray([0x08, 1]) + avl_data + io_data + bytearray([1])
     crc8 = crc16_arc(data_part8)
-    packet_c8 = bytearray(b'\x00\x00\x00\x00') + struct.pack(">I", len(data_part8)) + data_part8 + struct.pack(">I", crc8)
+    return bytearray(b'\x00\x00\x00\x00') + struct.pack(">I", len(data_part8)) + data_part8 + struct.pack(">I", crc8)
 
-    log.info("Teltonika: Fuel=%d л, Speed=%d км/год, Ignition=%d, Lat=%.6f, Lon=%.6f", 
-             int(level), speed, ignition, lat, lon)
 
-    max_retries = 3
+def generate_single_points(cfg: dict) -> list[dict]:
+    """
+    Формує реалістичну хронологію точок із повною відповідністю Детектору поїздок M2M:
+    - Поїздки > 60 сек, відстань > 100 м, швидкість > 1 км/год
+    - Стоянки > 300 сек (12-15 хвилин кожна)
+    - Плавний налив (+300 л) та плавний злив (-250 л)
+    Кінцева точка збігається з поточним часом (now).
+    """
+    timeline = []
+    
+    # Початкові координати першої стоянки (АЗС)
+    lat_gas, lon_gas = cfg["geo_lat"], cfg["geo_lon"]
+    # Координати другої стоянки (майданчик зливу)
+    lat_drain, lon_drain = lat_gas + 0.009, lon_gas + 0.009  # ~1 км зміщення
+
+    # 1. ПОЇЗДКА 1 (Під'їзд до АЗС): тривалість 120 с, дистанція ~600 м
+    t = 0
+    timeline.append({"t": t, "spd": 35, "ign": 1, "lat": lat_gas - 0.006, "lon": lon_gas - 0.006, "lvl": 150})
+    t += 60
+    timeline.append({"t": t, "spd": 30, "ign": 1, "lat": lat_gas - 0.003, "lon": lon_gas - 0.003, "lvl": 150})
+    t += 60
+
+    # 2. СТОЯНКА 1 (АЗС, Заправка): тривалість 900 с (15 ХВИЛИН!)
+    # Зупинка та глушіння двигуна
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_gas, "lon": lon_gas, "lvl": 150})
+    t += 120
+    # Базова полиця
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_gas, "lon": lon_gas, "lvl": 150})
+    
+    # Налив пального (+300 л) протягом 600 с (10 хвилин, ~30 л/хв)
+    for step in range(1, 6):
+        t += 120
+        lvl = 150 + int(60 * step)  # 210, 270, 330, 390, 450
+        timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_gas, "lon": lon_gas, "lvl": lvl})
+    
+    # Плато стабілізації після заправки (180 с = 3 хвилини)
+    t += 90
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_gas, "lon": lon_gas, "lvl": 450})
+    t += 90
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_gas, "lon": lon_gas, "lvl": 450})
+
+    # 3. ПОЇЗДКА 2 (Між АЗС та майданчиком): тривалість 120 с, дистанція ~1000 м
+    t += 10
+    timeline.append({"t": t, "spd": 0, "ign": 1, "lat": lat_gas, "lon": lon_gas, "lvl": 450})  # запуск мотора
+    t += 50
+    timeline.append({"t": t, "spd": 35, "ign": 1, "lat": lat_gas + 0.003, "lon": lon_gas + 0.003, "lvl": 450})
+    t += 60
+    timeline.append({"t": t, "spd": 30, "ign": 1, "lat": lat_gas + 0.006, "lon": lon_gas + 0.006, "lvl": 450})
+    t += 60
+
+    # 4. СТОЯНКА 2 (Майданчик, Злив): тривалість 720 с (12 ХВИЛИН!)
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_drain, "lon": lon_drain, "lvl": 450})
+    t += 120
+    # Базова полиця
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_drain, "lon": lon_drain, "lvl": 450})
+    
+    # Злив пального (-250 л) протягом 360 с (6 хвилин, ~40 л/хв)
+    drops = [400, 350, 300, 250, 200]
+    for lvl in drops:
+        t += 72
+        timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_drain, "lon": lon_drain, "lvl": lvl})
+
+    # Плато стабілізації після зливу (240 с = 4 хвилини)
+    t += 120
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_drain, "lon": lon_drain, "lvl": 200})
+    t += 120
+    timeline.append({"t": t, "spd": 0, "ign": 0, "lat": lat_drain, "lon": lon_drain, "lvl": 200})
+
+    # 5. ПОЇЗДКА 3 (Виїзд на маршрут): тривалість 120 с, дистанція ~600 м
+    t += 10
+    timeline.append({"t": t, "spd": 0, "ign": 1, "lat": lat_drain, "lon": lon_drain, "lvl": 200})
+    t += 50
+    timeline.append({"t": t, "spd": 35, "ign": 1, "lat": lat_drain + 0.003, "lon": lon_drain + 0.003, "lvl": 200})
+    t += 60
+    timeline.append({"t": t, "spd": 40, "ign": 1, "lat": lat_drain + 0.006, "lon": lon_drain + 0.006, "lvl": 200})
+
+    # Перетворюємо відносні секунди 't' на абсолютні UTC timestamp_ms так,
+    # щоб остання точка припадала на поточний момент (now)!
+    now_ms = int(time.time() * 1000)
+    total_duration_ms = t * 1000
+    start_ms = now_ms - total_duration_ms
+
+    points = []
+    for item in timeline:
+        pt_ms = start_ms + (item["t"] * 1000)
+        points.append({
+            "timestamp_ms": pt_ms,
+            "speed": item["spd"],
+            "ignition": item["ign"],
+            "lat": item["lat"],
+            "lon": item["lon"],
+            "level": item["lvl"],
+        })
+
+    return points
+
+
+def send_points_stream(cfg: dict, points: list[dict]) -> None:
+    host, port, imei = cfg["ingest_host"], cfg["ingest_port"], cfg["tracker_imei"]
+    max_retries = 5
+
     for attempt in range(1, max_retries + 1):
         try:
+            log.info("Підключення до %s:%d (спроба %d/%d)...", host, port, attempt, max_retries)
             with socket.create_connection((host, port), timeout=cfg["http_timeout_sec"]) as sock:
                 imei_b = imei.encode('ascii')
                 sock.sendall(struct.pack(">H", len(imei_b)) + imei_b)
                 resp = sock.recv(1)
                 if not resp or resp[0] != 1:
-                    log.warning("Handshake не підтверджено сервером: %s", resp)
-                    return
+                    raise OSError(f"Handshake не підтверджено сервером: {resp}")
                 
-                sock.sendall(packet_c8)
-                sock.recv(4)
-            return
+                log.info("Handshake успішний. Відправка %d точок єдиним потоком...", len(points))
+                for idx, pt in enumerate(points):
+                    packet = build_codec8_packet(cfg, pt)
+                    sock.sendall(packet)
+                    ack = sock.recv(4)
+                    time.sleep(0.05)  # 50 мс між пакетами
+                log.info("Усі %d точок успішно передано сервером!", len(points))
+                return
         except (socket.error, OSError) as e:
             if attempt == max_retries:
-                log.error("TCP Error вичерпано %d спроб: %s", max_retries, e)
+                log.error("TCP Error вичерпано всі спроби: %s", e)
                 raise
-            delay = 2 * attempt
-            log.warning("Помилка підключення до %s:%d (спроба %d/%d). Повтор через %d с: %s", 
-                        host, port, attempt, max_retries, delay, e)
+            delay = 3 * attempt
+            log.warning("Помилка сокету (%s). Повтор через %d с...", e, delay)
             time.sleep(delay)
 
 
 def send_canary_events(cfg: dict) -> datetime:
     start_time = datetime.now(timezone.utc)
-    interval = cfg["point_interval_sec"]
-    cur_lat, cur_lon = cfg["geo_lat"], cfg["geo_lon"]
-    base_l = cfg["baseline_level_l"]
-    refill_l = cfg["refill_target_l"]
-    drain_l = cfg["drain_target_l"]
-
-    # --- ЕТАП 1: ПОЧАТКОВА ПОЇЗДКА (Прибуття на АЗС) ---
-    log.info(">>> ЕТАП 1: Поїздка (під'їзд до АЗС)...")
-    for _ in range(cfg["trip_points"]):
-        cur_lat += 0.0001
-        cur_lon += 0.0001
-        _send_point(cfg, level=base_l, lat=cur_lat, lon=cur_lon, speed=cfg["trip_speed"], ignition=1)
-        time.sleep(interval)
-
-    # --- ЕТАП 2: ЗУПИНКА ТА ГЛУШІННЯ ДВИГУНА (Стоянка перед заправкою) ---
-    log.info(">>> ЕТАП 2: Зупинка та глушіння двигуна (Базовий рівень: %d л)...", base_l)
-    for _ in range(cfg["baseline_points"]):
-        _send_point(cfg, level=base_l, lat=cur_lat, lon=cur_lon, speed=0, ignition=0)
-        time.sleep(interval)
-
-    # --- ЕТАП 3: ОДИНОЧНА ЗАПРАВКА (Плавне зростання рівня) ---
-    log.info(">>> ЕТАП 3: Заправка (+%d л)...", refill_l - base_l)
-    ramp_pts = cfg["ramp_points"]
-    step = (refill_l - base_l) / ramp_pts
-    for i in range(1, ramp_pts + 1):
-        lvl = base_l + step * i
-        _send_point(cfg, level=lvl, lat=cur_lat, lon=cur_lon, speed=0, ignition=0)
-        time.sleep(interval)
-
-    # --- ЕТАП 4: ФІКСАЦІЯ ПІСЛЯ ЗАПРАВКИ (Плато стабілізації) ---
-    log.info(">>> ЕТАП 4: Плато стабілізації заправки (%d л)...", refill_l)
-    for _ in range(cfg["plateau_points"]):
-        _send_point(cfg, level=refill_l, lat=cur_lat, lon=cur_lon, speed=0, ignition=0)
-        time.sleep(interval)
-
-    # --- ЕТАП 5: ЗАПУСК ДВИГУНА ТА ВИЇЗД (Закриття стоянки заправки) ---
-    log.info(">>> ЕТАП 5: Виїзд з АЗС (закриття стоянки заправки)...")
-    for _ in range(cfg["trip_points"]):
-        cur_lat += 0.0001
-        cur_lon += 0.0001
-        _send_point(cfg, level=refill_l, lat=cur_lat, lon=cur_lon, speed=cfg["trip_speed"], ignition=1)
-        time.sleep(interval)
-
-    # --- ЕТАП 6: ЗУПИНКА НА СТОЯНКУ (Підготовка до зливу) ---
-    log.info(">>> ЕТАП 6: Зупинка на стоянку (вихідний рівень: %d л)...", refill_l)
-    for _ in range(cfg["baseline_points"]):
-        _send_point(cfg, level=refill_l, lat=cur_lat, lon=cur_lon, speed=0, ignition=0)
-        time.sleep(interval)
-
-    # --- ЕТАП 7: ЗЛИВ (Плавне ступінчасте падіння рівня) ---
-    log.info(">>> ЕТАП 7: Злив пального (-%d л)...", refill_l - drain_l)
-    drain_step = (refill_l - drain_l) / ramp_pts
-    for i in range(1, ramp_pts + 1):
-        lvl = refill_l - drain_step * i
-        _send_point(cfg, level=lvl, lat=cur_lat, lon=cur_lon, speed=0, ignition=0)
-        time.sleep(interval)
-
-    # --- ЕТАП 8: ФІКСАЦІЯ ПІСЛЯ ЗЛИВУ (Плато на нижньому рівні) ---
-    log.info(">>> ЕТАП 8: Плато після зливу (%d л)...", drain_l)
-    for _ in range(cfg["plateau_points"]):
-        _send_point(cfg, level=drain_l, lat=cur_lat, lon=cur_lon, speed=0, ignition=0)
-        time.sleep(interval)
-
-    # --- ЕТАП 9: ЗАПУСК ДВИГУНА ТА ВІД'ЇЗД (Закриття стоянки зливу) ---
-    log.info(">>> ЕТАП 9: Від'їзд зі стоянки (закриття стоянки зливу)...")
-    for _ in range(cfg["trip_points"]):
-        cur_lat += 0.0001
-        cur_lon += 0.0001
-        _send_point(cfg, level=drain_l, lat=cur_lat, lon=cur_lon, speed=cfg["trip_speed"], ignition=1)
-        time.sleep(interval)
-
-    log.info("Усі точки відправлено успішно!")
+    points = generate_single_points(cfg)
+    send_points_stream(cfg, points)
     return start_time
 
 
@@ -378,7 +403,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         report_lines.append("❌ Заправка")
 
     if ok_drain:
-        report_lines.append(f"✅ {drains_found[0]}")
+        report_lines.append(f"✅ Злив{drains_found[0]}")
     else:
         report_lines.append("❌ Злив")
 
