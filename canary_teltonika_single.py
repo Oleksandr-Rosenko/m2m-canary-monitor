@@ -19,6 +19,7 @@ import sys
 import time
 import socket
 import struct
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,11 +57,11 @@ CONFIG = {
     "api_token": os.getenv("M2M_API_TOKEN", ""),    
     "login_path": "/login",
     "history_path": "/notification/history",
-    "history_query": {"page": 1, "per_page": 50},
+    "history_query": {"page": 1, "per_page": 100},
 
-    "initial_wait_sec": 45,
-    "poll_interval_sec": 15,
-    "max_wait_sec": 420,
+    "initial_wait_sec": 60,
+    "poll_interval_sec": 20,
+    "max_wait_sec": 2100,
     "http_timeout_sec": 60,  
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -303,6 +304,30 @@ def fetch_history(cfg: dict) -> dict:
         return {}
 
 
+def resolve_device_id(cfg: dict) -> None:
+    if cfg.get("device_id"):
+        return
+    if not cfg.get("api_token") and not (cfg.get("api_email") and cfg.get("api_password")):
+        return
+    try:
+        if not cfg.get("api_token"):
+            refresh_api_token(cfg)
+        headers = {"Authorization": f"Bearer {cfg['api_token']}"}
+        url = f"{cfg['api_base_url']}/devices"
+        params = {"search": cfg["device_name"], "per_page": 20}
+        resp = GLOBAL_SESSION.get(url, headers=headers, params=params, timeout=cfg["http_timeout_sec"])
+        if resp.status_code == 200:
+            data = resp.json()
+            items = data.get("items") or data.get("data") or []
+            for d in items:
+                if d.get("name") == cfg["device_name"] or str(d.get("uniqueId")) == str(cfg["tracker_imei"]):
+                    cfg["device_id"] = d.get("id")
+                    log.info("Автоматично визначено device_id=%s для %s", cfg["device_id"], cfg["device_name"])
+                    return
+    except Exception as e:
+        log.warning("Не вдалося автоматично визначити device_id: %s", e)
+
+
 def get_existing_event_ids(cfg: dict) -> set:
     try: 
         res = fetch_history(cfg)
@@ -318,6 +343,12 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
     refills_found = []
     drains_found = []
 
+    target_name = cfg.get("device_name", "")
+    target_id = cfg.get("device_id")
+    target_imei = str(cfg.get("tracker_imei", ""))
+    target_refill = cfg["template_refill"].lower().rstrip(":")
+    target_drain = cfg["template_drain"].lower().rstrip(":")
+
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -328,67 +359,90 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         item_str = json.dumps(item, ensure_ascii=False)
         item_lower = item_str.lower()
         dev_id = item.get("deviceId")
-        dev_name = item.get("deviceName") or ""
+        dev_name = str(item.get("deviceName") or "")
+        unique_id = str(item.get("uniqueId") or "")
         
-        target_name = cfg.get("device_name", "")
-        target_id = cfg.get("device_id")
-        
+        # 1. Прив'язка до об'єкта (по ID, IMEI або назві)
         matched = False
         if target_id and dev_id == target_id:
             matched = True
-        elif target_name and (target_name.lower() in dev_name.lower() or target_name.lower() in item_lower):
+        elif target_imei and (unique_id == target_imei or target_imei in item_str):
+            matched = True
+        elif target_name and (
+            target_name.lower() in dev_name.lower()
+            or target_name.lower() in str(item.get("message", "")).lower()
+            or target_name.lower() in item_lower
+        ):
             matched = True
             
         if not matched:
             continue
             
-        raw_type = item.get("type", "").upper()
-        template_name = item.get("templateName") or ""
+        raw_type = str(item.get("type", "")).upper()
+        template_type = str(item.get("templateType", "")).upper()
+        template_name = str(item.get("templateName", "")).lower()
+        message = str(item.get("message", "")).lower()
         
+        # 2. Об'єм пального
         volume = None
         try:
             meta = item.get("metadata", {})
             if isinstance(meta, str): 
                 meta = json.loads(meta)
-            volume = meta.get("fuelVolume")
-            if volume is None:
-                finish = meta.get("fuelFinishValue")
-                start_val = meta.get("fuelStartValue")
-                if isinstance(finish, (int, float)) and isinstance(start_val, (int, float)):
-                    volume = round(abs(finish - start_val), 2)
+            if isinstance(meta, dict):
+                volume = meta.get("fuelVolume")
+                if volume is None:
+                    finish = meta.get("fuelFinishValue")
+                    start_val = meta.get("fuelStartValue")
+                    if isinstance(finish, (int, float)) and isinstance(start_val, (int, float)):
+                        volume = round(abs(finish - start_val), 2)
         except Exception:
             pass
+            
+        if volume is None:
+            m = re.search(r'об[\'’`]?ємом\s+([\d\.]+)\s*л', str(item.get("message", "")) + " " + item_str, re.I)
+            if m:
+                try:
+                    volume = float(m.group(1))
+                except Exception:
+                    pass
 
         vol_str = f" (+{volume} л)" if volume is not None else ""
         vol_drain_str = f" (-{volume} л)" if volume is not None else ""
 
-        target_refill = cfg["template_refill"].lower()
-        target_drain = cfg["template_drain"].lower()
-
+        # 3. Ідентифікація типу події
         if (
-            target_refill in template_name.lower() 
-            or target_refill in item_lower 
-            or raw_type in ("REFILL", "REFIL")
+            raw_type in ("REFILL", "REFIL")
+            or template_type in ("REFILL", "REFIL")
+            or target_refill in template_name
+            or target_refill in item_lower
+            or "заправк" in template_name
+            or "заправк" in message
         ):
-            refills_found.append(f"Заправка{vol_str}")
+            if not any(r["id"] == event_id for r in refills_found):
+                refills_found.append({"id": event_id, "vol_str": vol_str})
         elif (
-            target_drain in template_name.lower() 
-            or target_drain in item_lower 
-            or raw_type == "DRAIN"
+            raw_type in ("DRAIN",)
+            or template_type in ("DRAIN",)
+            or target_drain in template_name
+            or target_drain in item_lower
+            or "злив" in template_name
+            or "злив" in message
         ):
-            drains_found.append(f"Злив{vol_drain_str}")
+            if not any(d["id"] == event_id for d in drains_found):
+                drains_found.append({"id": event_id, "vol_str": vol_drain_str})
 
     ok_refill = len(refills_found) >= 1
     ok_drain = len(drains_found) >= 1
 
     report_lines = []
     if ok_refill:
-        report_lines.append(f"✅ {refills_found[0]}")
+        report_lines.append(f"✅ Заправка{refills_found[0]['vol_str']}")
     else:
         report_lines.append("❌ Заправка")
 
     if ok_drain:
-        report_lines.append(f"✅ {drains_found[0]}")
+        report_lines.append(f"✅ Злив{drains_found[0]['vol_str']}")
     else:
         report_lines.append("❌ Злив")
 
@@ -397,16 +451,22 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
 
 
 def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
-    log.info("Очікування сповіщень (%d с)...", cfg["initial_wait_sec"])
+    log.info("Початкова пауза (%d с) перед опитуванням історії...", cfg["initial_wait_sec"])
     time.sleep(cfg["initial_wait_sec"])
     deadline = time.monotonic() + cfg["max_wait_sec"]
+    start_poll = time.monotonic()
+    
     while True:
         ok, detail = check_events_in_history(cfg, start_time, initial_event_ids)
         if ok: 
+            elapsed = int(time.monotonic() - start_poll)
+            log.info("Усі очікувані сповіщення успішно знайдено (через %d с від початку опитування)!\n%s", elapsed, detail)
             return True, detail
         if time.monotonic() >= deadline: 
-            return False, f"Таймаут очікування сповіщень\n\n{detail}"
-        log.info("Опитування історії API...")
+            return False, f"Таймаут очікування сповіщень ({cfg['max_wait_sec']} с)\n\n{detail}"
+            
+        elapsed = int(time.monotonic() - start_poll)
+        log.info("Опитування історії API (пройшло %d/%d с)...", elapsed, cfg["max_wait_sec"])
         time.sleep(cfg["poll_interval_sec"])
 
 
@@ -451,6 +511,7 @@ def notify_success(cfg: dict, detail: str) -> None:
 def main() -> int:
     cfg, state = CONFIG, load_state(CONFIG)
     log.info("Запуск Canary Teltonika Single для %s (IMEI: %s)...", cfg["device_name"], cfg["tracker_imei"])
+    resolve_device_id(cfg)
     initial_ids = get_existing_event_ids(cfg)
     
     try:
