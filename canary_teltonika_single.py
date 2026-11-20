@@ -328,6 +328,22 @@ def resolve_device_id(cfg: dict) -> None:
         log.warning("Не вдалося автоматично визначити device_id: %s", e)
 
 
+def extract_event_time(item: dict) -> str:
+    msg = str(item.get("message") or "")
+    m_time = re.search(r'початку\s+[^\:]*:\s*(?:\d{2}\.\d{2}\.\d{4}\s+)?(\d{2}:\d{2})', msg, re.I)
+    if m_time:
+        return m_time.group(1)
+    m_general = re.search(r'\b(\d{2}:\d{2})\b', msg)
+    if m_general:
+        return m_general.group(1)
+    created = item.get("createdAt")
+    if created and isinstance(created, str):
+        m_iso = re.search(r'T(\d{2}:\d{2})', created)
+        if m_iso:
+            return m_iso.group(1)
+    return ""
+
+
 def get_existing_event_ids(cfg: dict) -> set:
     try: 
         res = fetch_history(cfg)
@@ -407,8 +423,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
                 except Exception:
                     pass
 
-        vol_str = f" (+{volume} л)" if volume is not None else ""
-        vol_drain_str = f" (-{volume} л)" if volume is not None else ""
+        ev_time = extract_event_time(item)
 
         # 3. Ідентифікація типу події
         if (
@@ -420,7 +435,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             or "заправк" in message
         ):
             if not any(r["id"] == event_id for r in refills_found):
-                refills_found.append({"id": event_id, "vol_str": vol_str})
+                refills_found.append({"id": event_id, "volume": volume, "time": ev_time})
         elif (
             raw_type in ("DRAIN",)
             or template_type in ("DRAIN",)
@@ -430,23 +445,27 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             or "злив" in message
         ):
             if not any(d["id"] == event_id for d in drains_found):
-                drains_found.append({"id": event_id, "vol_str": vol_drain_str})
+                drains_found.append({"id": event_id, "volume": volume, "time": ev_time})
 
-    ok_refill = len(refills_found) >= 1
-    ok_drain = len(drains_found) >= 1
+    refills_found.sort(key=lambda x: x["id"])
+    drains_found.sort(key=lambda x: x["id"])
 
     report_lines = []
-    if ok_refill:
-        report_lines.append(f"✅ Заправка{refills_found[0]['vol_str']}")
+    if len(refills_found) >= 1:
+        t_str = f" (час: {refills_found[0]['time']})" if refills_found[0].get("time") else ""
+        v_str = f": +{refills_found[0]['volume']} л" if refills_found[0].get("volume") is not None else ""
+        report_lines.append(f"✅ Заправка{v_str}{t_str}")
     else:
         report_lines.append("❌ Заправка")
 
-    if ok_drain:
-        report_lines.append(f"✅ Злив{drains_found[0]['vol_str']}")
+    if len(drains_found) >= 1:
+        t_str = f" (час: {drains_found[0]['time']})" if drains_found[0].get("time") else ""
+        v_str = f": -{drains_found[0]['volume']} л" if drains_found[0].get("volume") is not None else ""
+        report_lines.append(f"✅ Злив{v_str}{t_str}")
     else:
         report_lines.append("❌ Злив")
 
-    all_ok = ok_refill and ok_drain
+    all_ok = (len(refills_found) >= 1) and (len(drains_found) >= 1)
     return all_ok, "\n".join(report_lines)
 
 
@@ -496,8 +515,8 @@ def notify_incident(cfg: dict, detail: str) -> None:
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
 
 
-def notify_recovery(cfg: dict) -> None:
-    text = f"🟢 [Teltonika Single] Сповіщення пального відновилися!\nОб'єкт: {cfg['device_name']}"
+def notify_recovery(cfg: dict, detail: str) -> None:
+    text = f"🟢 [Teltonika Single] Сповіщення пального відновилися!\nОб'єкт: {cfg['device_name']}\n\n{detail}"
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
 
@@ -524,7 +543,7 @@ def main() -> int:
     if ok:
         log.info("Успіх!\n%s", detail)
         if state.get("incident_open"): 
-            notify_recovery(cfg)
+            notify_recovery(cfg, detail)
         else: 
             notify_success(cfg, detail)
         state["incident_open"] = False
