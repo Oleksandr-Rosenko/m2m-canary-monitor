@@ -1,6 +1,9 @@
 name: '[PROD] Canary Monitor (Teltonika Double Refill & Drain)'
 
 on:
+  schedule:
+    # Запускається на 15-й хвилині кожної 3-ї години (02:15, 05:15, 08:15... за Києвом)
+    - cron: '15 0,3,6,9,12,15,18,21 * * *'
   workflow_dispatch:
 
 jobs:
