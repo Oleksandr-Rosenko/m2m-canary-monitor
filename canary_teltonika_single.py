@@ -6,10 +6,10 @@ Canary-моніторинг конвеєра сповіщень M2M.
 Об'єкт: Refill_Drain_UNIT (IMEI: 12345678901234567890)
 Сервер: 95.217.119.27:5027
 
-РЕАЛЬНИЙ ЧАС ТА ПОВНА ВІДПОВІДНІСТЬ ДЕТЕКТОРУ ПОЇЗДОК M2M:
-- Стоянки: > 300 с (по 315-330 с, швидкість 0, рух 0, запалювання 0)
-- Поїздки: > 60 с (по 65-70 с, швидкість 35 км/год, дистанція > 500 м)
-- Точки передаються в РЕАЛЬНОМУ ЧАСІ з time.sleep() та поточними мітками часу.
+ВІДПОВІДНІСТЬ ПРОДУ ТА ДЕТЕКТОРУ ПОЇЗДОК M2M:
+- Формат пакета: 100% як на проді (запалювання ID 239 ЗАВЖДИ 1 для розрахунку датчика на льоту!)
+- Визначення стоянки: по GPS швидкості (speed = 0, movement = 0 тривалістю > 300 с)
+- Поїздки: > 60 с, дистанція > 500 м
 """
 
 import json
@@ -46,9 +46,9 @@ CONFIG = {
     
     "geo_lat": 49.438923,
     "geo_lon": 32.085565,
-    "altitude": 120,
-    "bearing": 180, 
-    "sat": 14,      
+    "altitude": 10,
+    "bearing": 210, 
+    "sat": 12,      
 
     "api_base_url": "https://my.m2m.eu/api",
     "api_email": os.getenv("M2M_EMAIL", ""),        
@@ -58,10 +58,10 @@ CONFIG = {
     "history_path": "/notification/history",
     "history_query": {"page": 1, "per_page": 50},
 
-    "initial_wait_sec": 30,
+    "initial_wait_sec": 45,
     "poll_interval_sec": 15,
-    "max_wait_sec": 360,
-    "http_timeout_sec": 30,  
+    "max_wait_sec": 420,
+    "http_timeout_sec": 60,  
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -101,7 +101,7 @@ def crc16_arc(data: bytes) -> int:
     return crc
 
 
-def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0, ignition: int = 0) -> None:
+def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0) -> None:
     host, port, imei = cfg["ingest_host"], cfg["ingest_port"], cfg["tracker_imei"]
     timestamp_ms = int(time.time() * 1000)
     
@@ -116,12 +116,12 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
     io_data.append(0)  # Event IO ID
     io_data.append(3)  # Total IO elements: 3
     
-    # 1-byte IOs: Movement (240) and Ignition (239)
+    # 1-byte IOs: Movement (240) та Ignition (239)
     io_data.append(2)
     io_data.append(240)
     io_data.append(1 if speed > 0 else 0)
     io_data.append(239)
-    io_data.append(1 if ignition else 0)
+    io_data.append(1)  # ЗАПАЛЮВАННЯ ЗАВЖДИ 1 (як на проді, щоб датчик рахувався на льоту!)
     
     # 2-byte IOs: Fuel level (201)
     io_data.append(1)
@@ -136,10 +136,10 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
     crc8 = crc16_arc(data_part8)
     packet_c8 = bytearray(b'\x00\x00\x00\x00') + struct.pack(">I", len(data_part8)) + data_part8 + struct.pack(">I", crc8)
 
-    log.info("Teltonika: Fuel=%d л, Speed=%d км/год, Ignition=%d (lat=%.5f, lon=%.5f)", 
-             int(level), speed, ignition, lat, lon)
+    log.info("Teltonika: Fuel=%d л, Speed=%d км/год, Ignition=1 (lat=%.5f, lon=%.5f)", 
+             int(level), speed, lat, lon)
 
-    max_retries = 4
+    max_retries = 5
     for attempt in range(1, max_retries + 1):
         try:
             with socket.create_connection((host, port), timeout=cfg["http_timeout_sec"]) as sock:
@@ -154,7 +154,7 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
             return
         except (socket.error, OSError) as e:
             if attempt == max_retries:
-                log.error("TCP Error вичерпано всі спроби: %s", e)
+                log.error("TCP Error вичерпано всі спроби (%d): %s", max_retries, e)
                 raise
             delay = 3 * attempt
             log.warning("Помилка підключення (спроба %d/%d). Повтор через %d с: %s", attempt, max_retries, delay, e)
@@ -167,7 +167,7 @@ def send_canary_events(cfg: dict) -> datetime:
     lat_drain, lon_drain = lat_gas + 0.009, lon_gas + 0.009
 
     # -------------------------------------------------------------
-    # 1. ПОЇЗДКА 1 (Під'їзд до АЗС): тривалість ~65 с, дистанція > 500 м
+    # 1. ПОЇЗДКА 1 (Під'їзд до АЗС): тривалість ~64 с, дистанція > 500 м
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 1: Поїздка до АЗС (> 60 с, > 100 м, швидкість 35 км/год)...")
     trip1_coords = [
@@ -177,17 +177,17 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_gas - 0.001, lon_gas - 0.001),
     ]
     for lat, lon in trip1_coords:
-        _send_point(cfg, level=150, lat=lat, lon=lon, speed=35, ignition=1)
+        _send_point(cfg, level=150, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     # -------------------------------------------------------------
     # 2. СТОЯНКА 1 (АЗС, Заправка): тривалість 315 с (5 хв 15 с > 300 с!)
-    # Швидкість 0, рух 0, запалювання 0, координати строго константні!
+    # Швидкість 0, рух 0, запалювання 1, координати константні!
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 2: Стоянка під заправку (315 с > 300 с для Детектора поїздок)...")
     # Базова полиця: 30 с (2 точки по 15 с)
     for _ in range(2):
-        _send_point(cfg, level=150, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+        _send_point(cfg, level=150, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # Налив пального (+300 л): 14 точок по 15 с (210 с / 3.5 хв)
@@ -195,17 +195,17 @@ def send_canary_events(cfg: dict) -> datetime:
     step = 300.0 / 14
     for i in range(1, 15):
         lvl = 150 + step * i
-        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # Плато стабілізації: 75 с (5 точок по 15 с)
     log.info(">>> ЕТАП 2.2: Плато стабілізації (450 л)...")
     for _ in range(5):
-        _send_point(cfg, level=450, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+        _send_point(cfg, level=450, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
-    # 3. ПОЇЗДКА 2 (Закриття стоянки заправки): ~65 с, дистанція > 500 м
+    # 3. ПОЇЗДКА 2 (Закриття стоянки заправки): ~64 с, дистанція > 500 м
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 3: Виїзд з АЗС (закриває стоянку заправки в M2M)...")
     trip2_coords = [
@@ -215,16 +215,15 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_gas + 0.008, lon_gas + 0.008),
     ]
     for lat, lon in trip2_coords:
-        _send_point(cfg, level=450, lat=lat, lon=lon, speed=35, ignition=1)
+        _send_point(cfg, level=450, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     # -------------------------------------------------------------
     # 4. СТОЯНКА 2 (Злив): тривалість 315 с (5 хв 15 с > 300 с!)
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 4: Стоянка під злив (315 с > 300 с)...")
-    # Базова полиця: 30 с (2 точки по 15 с)
     for _ in range(2):
-        _send_point(cfg, level=450, lat=lat_drain, lon=lon_drain, speed=0, ignition=0)
+        _send_point(cfg, level=450, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # Злив пального (-250 л): 13 точок по 15 с (195 с / 3.25 хв)
@@ -232,17 +231,17 @@ def send_canary_events(cfg: dict) -> datetime:
     drain_step = 250.0 / 13
     for i in range(1, 14):
         lvl = 450 - drain_step * i
-        _send_point(cfg, level=lvl, lat=lat_drain, lon=lon_drain, speed=0, ignition=0)
+        _send_point(cfg, level=lvl, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # Плато після зливу: 90 с (6 точок по 15 с)
     log.info(">>> ЕТАП 4.2: Плато після зливу (200 л)...")
     for _ in range(6):
-        _send_point(cfg, level=200, lat=lat_drain, lon=lon_drain, speed=0, ignition=0)
+        _send_point(cfg, level=200, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
-    # 5. ПОЇЗДКА 3 (Закриття стоянки зливу): ~65 с, дистанція > 500 м
+    # 5. ПОЇЗДКА 3 (Закриття стоянки зливу): ~64 с, дистанція > 500 м
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 5: Від'їзд зі стоянки (закриває стоянку зливу в M2M)...")
     trip3_coords = [
@@ -252,7 +251,7 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_drain + 0.008, lon_drain + 0.008),
     ]
     for lat, lon in trip3_coords:
-        _send_point(cfg, level=200, lat=lat, lon=lon, speed=35, ignition=1)
+        _send_point(cfg, level=200, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     log.info("Усі точки в реальному часі відправлено успішно!")

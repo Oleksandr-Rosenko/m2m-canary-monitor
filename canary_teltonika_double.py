@@ -6,10 +6,11 @@ Canary-моніторинг конвеєра сповіщень M2M.
 Об'єкт: Refill_Drain_UNIT_double (IMEI: 68162416785325812345)
 Сервер: 95.217.119.27:5027
 
-РЕАЛЬНИЙ ЧАС ТА ПОВНА ВІДПОВІДНІСТЬ ДЕТЕКТОРУ ПОЇЗДОК M2M:
-- Стоянки: > 300 с (стоянка заправок 345 с, зливу 315 с)
-- Різниця початків заправок: РІВНО 3 ХВИЛИНИ (180 с між стартом #1 та стартом #2)
-- Поїздки: > 60 с (по 65 с, швидкість 35 км/год, дистанція > 500 м)
+ВІДПОВІДНІСТЬ ПРОДУ ТА ДЕТЕКТОРУ ПОЇЗДОК M2M:
+- Формат пакета: 100% як на проді (запалювання ID 239 ЗАВЖДИ 1 для розрахунку датчика на льоту!)
+- Різниця початків заправок: РІВНО 6 ХВИЛИН (360 секунд між стартом #1 та стартом #2)
+- Визначення стоянки: по GPS швидкості (speed = 0, movement = 0 тривалістю > 300 с)
+- Поїздки: > 60 с, дистанція > 500 м
 """
 
 import json
@@ -46,9 +47,9 @@ CONFIG = {
     
     "geo_lat": 49.438923,
     "geo_lon": 32.085565,
-    "altitude": 120,
-    "bearing": 180, 
-    "sat": 14,      
+    "altitude": 10,
+    "bearing": 210, 
+    "sat": 12,      
 
     "api_base_url": "https://my.m2m.eu/api",
     "api_email": os.getenv("M2M_EMAIL", ""),        
@@ -58,10 +59,10 @@ CONFIG = {
     "history_path": "/notification/history",
     "history_query": {"page": 1, "per_page": 50},
 
-    "initial_wait_sec": 30,
+    "initial_wait_sec": 45,
     "poll_interval_sec": 15,
-    "max_wait_sec": 360,
-    "http_timeout_sec": 30,  
+    "max_wait_sec": 420,
+    "http_timeout_sec": 60,  
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
@@ -101,7 +102,7 @@ def crc16_arc(data: bytes) -> int:
     return crc
 
 
-def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0, ignition: int = 0) -> None:
+def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0) -> None:
     host, port, imei = cfg["ingest_host"], cfg["ingest_port"], cfg["tracker_imei"]
     timestamp_ms = int(time.time() * 1000)
     
@@ -116,12 +117,12 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
     io_data.append(0)  # Event IO ID
     io_data.append(3)  # Total IO elements: 3
     
-    # 1-byte IOs: Movement (240) and Ignition (239)
+    # 1-byte IOs: Movement (240) та Ignition (239)
     io_data.append(2)
     io_data.append(240)
     io_data.append(1 if speed > 0 else 0)
     io_data.append(239)
-    io_data.append(1 if ignition else 0)
+    io_data.append(1)  # ЗАПАЛЮВАННЯ ЗАВЖДИ 1 (як на проді, щоб датчик рахувався на льоту!)
     
     # 2-byte IOs: Fuel level (201)
     io_data.append(1)
@@ -136,10 +137,10 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
     crc8 = crc16_arc(data_part8)
     packet_c8 = bytearray(b'\x00\x00\x00\x00') + struct.pack(">I", len(data_part8)) + data_part8 + struct.pack(">I", crc8)
 
-    log.info("Teltonika: Fuel=%d л, Speed=%d км/год, Ignition=%d (lat=%.5f, lon=%.5f)", 
-             int(level), speed, ignition, lat, lon)
+    log.info("Teltonika: Fuel=%d л, Speed=%d км/год, Ignition=1 (lat=%.5f, lon=%.5f)", 
+             int(level), speed, lat, lon)
 
-    max_retries = 4
+    max_retries = 5
     for attempt in range(1, max_retries + 1):
         try:
             with socket.create_connection((host, port), timeout=cfg["http_timeout_sec"]) as sock:
@@ -154,7 +155,7 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0,
             return
         except (socket.error, OSError) as e:
             if attempt == max_retries:
-                log.error("TCP Error вичерпано всі спроби: %s", e)
+                log.error("TCP Error вичерпано всі спроби (%d): %s", max_retries, e)
                 raise
             delay = 3 * attempt
             log.warning("Помилка підключення (спроба %d/%d). Повтор через %d с: %s", attempt, max_retries, delay, e)
@@ -167,7 +168,7 @@ def send_canary_events(cfg: dict) -> datetime:
     lat_drain, lon_drain = lat_gas + 0.009, lon_gas + 0.009
 
     # -------------------------------------------------------------
-    # 1. ПОЇЗДКА 1 (Під'їзд до АЗС): ~65 с, дистанція > 500 м
+    # 1. ПОЇЗДКА 1 (Під'їзд до АЗС): ~64 с, дистанція > 500 м
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 1: Поїздка до АЗС (> 60 с, > 100 м, швидкість 35 км/год)...")
     trip1_coords = [
@@ -177,48 +178,48 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_gas - 0.001, lon_gas - 0.001),
     ]
     for lat, lon in trip1_coords:
-        _send_point(cfg, level=128, lat=lat, lon=lon, speed=35, ignition=1)
+        _send_point(cfg, level=128, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     # -------------------------------------------------------------
-    # 2. СТОЯНКА 1 (Подвійна заправка): тривалість 345 с (5.75 хв > 300 с!)
-    # Швидкість 0, рух 0, запалювання 0, координати константні!
+    # 2. СТОЯНКА 1 (Подвійна заправка): тривалість 525 с (8.75 хв > 300 с!)
+    # Швидкість 0, рух 0, запалювання 1, координати константні!
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 2: Стоянка під подвійну заправку (345 с > 300 с)...")
+    log.info(">>> ЕТАП 2: Стоянка під подвійну заправку (525 с > 300 с для Детектора поїздок)...")
     # Базова полиця: 30 с (2 точки по 15 с)
     for _ in range(2):
-        _send_point(cfg, level=128, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+        _send_point(cfg, level=128, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # ЗАПРАВКА #1: Старт на t=30 с. Зростання 128 -> 402 л (+274 л) за 75 с (5 точок по 15 с)
     log.info(">>> ЕТАП 2.1: СТАРТ Заправки #1 (з 128 л до 402 л)...")
     stg1_steps = [182, 237, 292, 347, 402]
     for lvl in stg1_steps:
-        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # ПРОМІЖНА ПОЛИЦЯ / ПАУЗА: триває з t=105 с до t=210 с (105 с = 1.75 хв)
-    # Забезпечує РІВНО 3 ХВИЛИНИ (180 с) між початком #1 (t=30 с) і початком #2 (t=210 с)!
-    log.info(">>> ЕТАП 2.2: Проміжна полиця на 402 л (пауза до 3-ї хвилини)...")
-    for _ in range(7):
-        _send_point(cfg, level=402, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+    # ПРОМІЖНА ПОЛИЦЯ / ПАУЗА: триває з t=105 с до t=390 с (285 с = 4.75 хвилини, 19 точок по 15 с)
+    # Забезпечує РІВНО 6 ХВИЛИН (360 с) між стартом #1 (t=30 с) і стартом #2 (t=390 с)!
+    log.info(">>> ЕТАП 2.2: Проміжна полиця на 402 л (пауза до настання 6-ї хвилини)...")
+    for i in range(1, 20):
+        _send_point(cfg, level=402, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # ЗАПРАВКА #2: Старт на t=210 с (рівно 3 хв після старту #1!). Зростання 402 -> 630 л (+228 л) за 60 с (4 точки по 15 с)
-    log.info(">>> ЕТАП 2.3: СТАРТ Заправки #2 (через 3 хвилини після першої!)...")
+    # ЗАПРАВКА #2: Старт на t=390 с (рівно 6 хвилин після старту #1!). Зростання 402 -> 630 л (+228 л) за 60 с (4 точки по 15 с)
+    log.info(">>> ЕТАП 2.3: СТАРТ Заправки #2 (РІВНО ЧЕРЕЗ 6 ХВИЛИН після першої!)...")
     stg2_steps = [459, 516, 573, 630]
     for lvl in stg2_steps:
-        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # ФІНАЛЬНЕ ПЛАТО ПІСЛЯ ЗАПРАВОК: 75 с (5 точок по 15 с)
     log.info(">>> ЕТАП 2.4: Фінальне плато після заправок (630 л)...")
     for _ in range(5):
-        _send_point(cfg, level=630, lat=lat_gas, lon=lon_gas, speed=0, ignition=0)
+        _send_point(cfg, level=630, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
-    # 3. ПОЇЗДКА 2 (Закриття стоянки подвійної заправки): ~65 с, дистанція > 500 м
+    # 3. ПОЇЗДКА 2 (Закриття стоянки подвійної заправки): ~64 с, дистанція > 500 м
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 3: Виїзд з АЗС (закриває стоянку заправок в M2M)...")
     trip2_coords = [
@@ -228,7 +229,7 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_gas + 0.008, lon_gas + 0.008),
     ]
     for lat, lon in trip2_coords:
-        _send_point(cfg, level=630, lat=lat, lon=lon, speed=35, ignition=1)
+        _send_point(cfg, level=630, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     # -------------------------------------------------------------
@@ -236,7 +237,7 @@ def send_canary_events(cfg: dict) -> datetime:
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 4: Стоянка під злив (315 с > 300 с)...")
     for _ in range(2):
-        _send_point(cfg, level=630, lat=lat_drain, lon=lon_drain, speed=0, ignition=0)
+        _send_point(cfg, level=630, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # Злив пального (-300 л): з 630 до 330 л за 195 с (13 точок по 15 с)
@@ -244,17 +245,17 @@ def send_canary_events(cfg: dict) -> datetime:
     drain_step = 300.0 / 13
     for i in range(1, 14):
         lvl = 630 - drain_step * i
-        _send_point(cfg, level=lvl, lat=lat_drain, lon=lon_drain, speed=0, ignition=0)
+        _send_point(cfg, level=lvl, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # Плато після зливу: 90 с (6 точок по 15 с)
     log.info(">>> ЕТАП 4.2: Плато після зливу (330 л)...")
     for _ in range(6):
-        _send_point(cfg, level=330, lat=lat_drain, lon=lon_drain, speed=0, ignition=0)
+        _send_point(cfg, level=330, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
-    # 5. ПОЇЗДКА 3 (Закриття стоянки зливу): ~65 с, дистанція > 500 м
+    # 5. ПОЇЗДКА 3 (Закриття стоянки зливу): ~64 с, дистанція > 500 м
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 5: Від'їзд зі стоянки (закриває стоянку зливу в M2M)...")
     trip3_coords = [
@@ -264,7 +265,7 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_drain + 0.008, lon_drain + 0.008),
     ]
     for lat, lon in trip3_coords:
-        _send_point(cfg, level=330, lat=lat, lon=lon, speed=35, ignition=1)
+        _send_point(cfg, level=330, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     log.info("Усі точки подвійної заправки та зливу в реальному часі відправлено успішно!")
