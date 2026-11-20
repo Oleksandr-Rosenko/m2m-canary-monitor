@@ -392,7 +392,12 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         dev_id = item.get("deviceId")
         unique_id = str(item.get("uniqueId") or "")
         
-        # 1. Прив'язка до тестового прод-об'єкта
+        raw_type = str(item.get("type", "")).upper()
+        template_type = str(item.get("templateType", "")).upper()
+        template_name = str(item.get("templateName", "")).lower()
+        message = str(item.get("message", "")).lower()
+
+        # 1. Прив'язка до тестового прод-об'єкта (по ID, IMEI, назві АБО по унікальному шаблону об'єкта!)
         matched = False
         if target_id and dev_id == target_id:
             matched = True
@@ -400,18 +405,20 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             matched = True
         elif target_name and (
             target_name.lower() in dev_name.lower()
-            or target_name.lower() in str(item.get("message", "")).lower()
+            or target_name.lower() in message
             or target_name.lower() in item_lower
+        ):
+            matched = True
+        elif (
+            target_refill in template_name
+            or target_drain in template_name
+            or target_refill in item_lower
+            or target_drain in item_lower
         ):
             matched = True
 
         if not matched:
             continue
-
-        raw_type = str(item.get("type", "")).upper()
-        template_type = str(item.get("templateType", "")).upper()
-        template_name = str(item.get("templateName", "")).lower()
-        message = str(item.get("message", "")).lower()
         
         # 2. Витягуємо об'єм пального
         volume = None
@@ -491,7 +498,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         report_lines.append("❌ Злив")
 
     all_ok = (len(refills_found) >= 2) and (len(drains_found) >= 1)
-    return all_ok, "\n".join(report_lines)
+    return all_ok, "\n".join(report_lines), len(refills_found), len(drains_found)
 
 
 def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
@@ -501,7 +508,7 @@ def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> 
     start_poll = time.monotonic()
     
     while True:
-        ok, detail = check_events_in_history(cfg, start_time, initial_event_ids)
+        ok, detail, n_ref, n_drain = check_events_in_history(cfg, start_time, initial_event_ids)
         if ok: 
             elapsed = int(time.monotonic() - start_poll)
             log.info("Усі очікувані сповіщення успішно знайдено (через %d с від початку опитування)!\n%s", elapsed, detail)
@@ -510,7 +517,10 @@ def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> 
             return False, f"Таймаут очікування сповіщень ({cfg['max_wait_sec']} с)\n\n{detail}"
             
         elapsed = int(time.monotonic() - start_poll)
-        log.info("Опитування історії API (пройшло %d/%d с)...", elapsed, cfg["max_wait_sec"])
+        log.info(
+            "Опитування історії API (пройшло %d/%d с, знайдено заправок: %d/2, зливів: %d/1)...", 
+            elapsed, cfg["max_wait_sec"], n_ref, n_drain
+        )
         time.sleep(cfg["poll_interval_sec"])
 
 
