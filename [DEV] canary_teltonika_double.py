@@ -347,6 +347,36 @@ def resolve_device_id(cfg: dict) -> None:
         log.warning("Не вдалося автоматично визначити device_id: %s", e)
 
 
+try:
+    from zoneinfo import ZoneInfo
+    KYIV_TZ = ZoneInfo("Europe/Kyiv")
+except Exception:
+    from datetime import timezone, timedelta
+    KYIV_TZ = timezone(timedelta(hours=2))
+
+
+def parse_item_timestamp(item: dict) -> float | None:
+    for field in ("createdAt", "eventTime", "serverTime", "time"):
+        val = item.get(field)
+        if isinstance(val, (int, float)):
+            return float(val) / 1000.0 if val > 1e11 else float(val)
+        if isinstance(val, str) and val.strip():
+            try:
+                return datetime.fromisoformat(val.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                pass
+    msg = str(item.get("message") or "")
+    m = re.search(r'(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?', msg)
+    if m:
+        try:
+            day, month, year, hour, minute = map(int, m.groups()[:5])
+            sec = int(m.group(6)) if m.group(6) else 0
+            return datetime(year, month, day, hour, minute, sec, tzinfo=KYIV_TZ).timestamp()
+        except Exception:
+            pass
+    return None
+
+
 def extract_event_time(item: dict) -> str:
     msg = str(item.get("message") or "")
     m_time = re.search(r'початку\s+[^\:]*:\s*(?:\d{2}\.\d{2}\.\d{4}\s+)?(\d{2}:\d{2})', msg, re.I)
@@ -363,16 +393,18 @@ def extract_event_time(item: dict) -> str:
     return ""
 
 
-def get_existing_event_ids(cfg: dict) -> set:
+def get_existing_event_ids(cfg: dict) -> tuple[set, int]:
     try: 
         res = fetch_history(cfg)
         items = res.get("items") or res.get("data") or []
-        return {item.get("id") for item in items if isinstance(item, dict) and item.get("id") is not None}
+        ids = {item.get("id") for item in items if isinstance(item, dict) and item.get("id") is not None}
+        max_id = max(ids) if ids else 0
+        return ids, max_id
     except Exception: 
-        return set()
+        return set(), 0
 
 
-def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
+def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, max_initial_id: int) -> tuple[bool, str, int, int]:
     res = fetch_history(cfg)
     items = res.get("items") or res.get("data") or []
     refills_found = []
@@ -388,7 +420,16 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         if not isinstance(item, dict):
             continue
         event_id = item.get("id")
+        
+        # 1. Відкидаємо сповіщення, що вже існували до старту екшенса
         if event_id in initial_event_ids: 
+            continue
+        if max_initial_id and isinstance(event_id, int) and event_id <= max_initial_id:
+            continue
+
+        # 2. Відкидаємо сповіщення з часом, старішим за старт поточного запуску
+        ev_ts = parse_item_timestamp(item)
+        if ev_ts is not None and ev_ts < (start_ts - 60):
             continue
             
         item_str = json.dumps(item, ensure_ascii=False)
@@ -506,14 +547,14 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
     return all_ok, "\n".join(report_lines), len(refills_found), len(drains_found)
 
 
-def wait_for_events(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
+def wait_for_events(cfg: dict, start_ts: float, initial_event_ids: set, max_initial_id: int) -> tuple[bool, str]:
     log.info("Початкова пауза (%d с) перед опитуванням історії...", cfg["initial_wait_sec"])
     time.sleep(cfg["initial_wait_sec"])
     deadline = time.monotonic() + cfg["max_wait_sec"]
     start_poll = time.monotonic()
     
     while True:
-        ok, detail, n_ref, n_drain = check_events_in_history(cfg, start_time, initial_event_ids)
+        ok, detail, n_ref, n_drain = check_events_in_history(cfg, start_ts, initial_event_ids, max_initial_id)
         if ok: 
             elapsed = int(time.monotonic() - start_poll)
             log.info("Усі очікувані сповіщення успішно знайдено (через %d с від початку опитування)!\n%s", elapsed, detail)
@@ -571,15 +612,19 @@ def main() -> int:
     cfg, state = CONFIG, load_state(CONFIG)
     log.info("Запуск Canary Teltonika Double для %s (IMEI: %s)...", cfg["device_name"], cfg["tracker_imei"])
     resolve_device_id(cfg)
-    initial_ids = get_existing_event_ids(cfg)
+    
+    start_ts = time.time()
+    initial_ids, max_initial_id = get_existing_event_ids(cfg)
+    log.info("Фіксація старту: %d наявних сповіщень в історії (max_id=%s, start_ts=%.0f)", 
+             len(initial_ids), max_initial_id, start_ts)
     
     try:
-        start = send_canary_events(cfg)
+        send_canary_events(cfg)
     except Exception as e:
         notify_incident(cfg, f"Помилка відправки точок по TCP: {e}")
         return 1
 
-    ok, detail = wait_for_events(cfg, start, initial_ids)
+    ok, detail = wait_for_events(cfg, start_ts, initial_ids, max_initial_id)
     if ok:
         log.info("Успіх!\n%s", detail)
         if state.get("incident_open"): 
