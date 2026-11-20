@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
 Canary-моніторинг конвеєра сповіщень M2M.
-СЦЕНАРІЙ 2: ПОДВІЙНА ЗАПРАВКА НА ОДНІЙ СТОЯНЦІ ТА ЗЛИВ (Double Refill + Drain)
-ТЕСТ НА ПРОДАКШЕН-ОБ'ЄКТІ: Test_Notification_o.rosenko (IMEI: 123456789011111)
-СЕРВЕР: 213.239.234.94:5027 (hw.m2m.eu)
+СЦЕНАРІЙ 2: [DEV] ПОДВІЙНА ЗАПРАВКА ПІДРЯД ТА ЗЛИВ (Double Refill + Drain)
+ПРОТОКОЛ: TELTONIKA (Codec 8)
+Об'єкт: Refill_Drain_UNIT_double (IMEI: 68162416785325812345)
+Сервер прийому: 95.217.119.27:5027
+API: https://dev-stag.m2m.eu/api
 
 ВІДПОВІДНІСТЬ ПРОДУ ТА ДЕТЕКТОРУ ПОЇЗДОК M2M:
 - Формат пакета: 100% як на проді (запалювання ID 239 ЗАВЖДИ 1 для розрахунку датчика на льоту!)
@@ -28,22 +30,22 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("canary_teltonika_double_prod")
+log = logging.getLogger("canary_teltonika_double")
 
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
 
 CONFIG = {
-    "device_id": 9405,
-    "device_name": "Test_Notification_o.rosenko",
-    "tracker_imei": "123456789011111",
+    "device_id": None,
+    "device_name": "Refill_Drain_UNIT_double",
+    "tracker_imei": "68162416785325812345",
     
-    "ingest_host": "213.239.234.94",
+    "ingest_host": "95.217.119.27",
     "ingest_port": 5027,
     
-    "template_refill": "TEST_Notification-Rosenko_Refill",
-    "template_drain": "TEST_Notification-Rosenko_Drain",
+    "template_refill": "Заправка (Сценарій 2 - Double)",
+    "template_drain": "Злив (Сценарій 2 - Double)",
     
     "geo_lat": 49.438923,
     "geo_lon": 32.085565,
@@ -51,7 +53,7 @@ CONFIG = {
     "bearing": 210, 
     "sat": 12,      
 
-    "api_base_url": "https://my.m2m.eu/api",
+    "api_base_url": os.getenv("M2M_API_BASE_URL", "https://dev-stag.m2m.eu/api"),
     "api_email": os.getenv("M2M_EMAIL", ""),        
     "api_password": os.getenv("M2M_PASSWORD", ""),  
     "api_token": os.getenv("M2M_API_TOKEN", ""),    
@@ -67,7 +69,7 @@ CONFIG = {
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
     "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", ""),
     "telegram_dm_chat_id": os.getenv("TELEGRAM_DM_CHAT_ID", ""),
-    "state_file": Path(os.getenv("CANARY_STATE_FILE", "notification_canary_teltonika_double_prod_state.json")),
+    "state_file": Path(os.getenv("CANARY_STATE_FILE", "notification_canary_teltonika_double_dev_state.json")),
 }
 
 # --------------------------------------------------------------------------
@@ -178,7 +180,7 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_gas - 0.001, lon_gas - 0.001),
     ]
     for lat, lon in trip1_coords:
-        _send_point(cfg, level=400, lat=lat, lon=lon, speed=35)
+        _send_point(cfg, level=128, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     # -------------------------------------------------------------
@@ -188,34 +190,34 @@ def send_canary_events(cfg: dict) -> datetime:
     log.info(">>> ЕТАП 2: Стоянка під подвійну заправку (525 с > 300 с для Детектора поїздок)...")
     # Базова полиця: 30 с (2 точки по 15 с)
     for _ in range(2):
-        _send_point(cfg, level=400, lat=lat_gas, lon=lon_gas, speed=0)
+        _send_point(cfg, level=128, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # ЗАПРАВКА #1: Старт на t=30 с. Зростання 400 -> 550 л (+150 л) за 75 с (5 точок по 15 с)
-    log.info(">>> ЕТАП 2.1: СТАРТ Заправки #1 (з 400 л до 550 л)...")
-    stg1_steps = [430, 460, 490, 520, 550]
+    # ЗАПРАВКА #1: Старт на t=30 с. Зростання 128 -> 402 л (+274 л) за 75 с (5 точок по 15 с)
+    log.info(">>> ЕТАП 2.1: СТАРТ Заправки #1 (з 128 л до 402 л)...")
+    stg1_steps = [182, 237, 292, 347, 402]
     for lvl in stg1_steps:
         _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # ПРОМІЖНА ПОЛИЦЯ / ПАУЗА: триває з t=105 с до t=390 с (285 с = 4.75 хвилини, 19 точок по 15 с)
     # Забезпечує РІВНО 6 ХВИЛИН (360 с) між стартом #1 (t=30 с) і стартом #2 (t=390 с)!
-    log.info(">>> ЕТАП 2.2: Проміжна полиця на 550 л (пауза до настання 6-ї хвилини)...")
+    log.info(">>> ЕТАП 2.2: Проміжна полиця на 402 л (пауза до настання 6-ї хвилини)...")
     for i in range(1, 20):
-        _send_point(cfg, level=550, lat=lat_gas, lon=lon_gas, speed=0)
+        _send_point(cfg, level=402, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # ЗАПРАВКА #2: Старт на t=390 с (рівно 6 хвилин після старту #1!). Зростання 550 -> 700 л (+150 л) за 60 с (4 точки по 15 с)
+    # ЗАПРАВКА #2: Старт на t=390 с (рівно 6 хвилин після старту #1!). Зростання 402 -> 630 л (+228 л) за 60 с (4 точки по 15 с)
     log.info(">>> ЕТАП 2.3: СТАРТ Заправки #2 (РІВНО ЧЕРЕЗ 6 ХВИЛИН після першої!)...")
-    stg2_steps = [587, 625, 662, 700]
+    stg2_steps = [459, 516, 573, 630]
     for lvl in stg2_steps:
         _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # ФІНАЛЬНЕ ПЛАТО ПІСЛЯ ЗАПРАВОК: 75 с (5 точок по 15 с)
-    log.info(">>> ЕТАП 2.4: Фінальне плато після заправок (700 л)...")
+    log.info(">>> ЕТАП 2.4: Фінальне плато після заправок (630 л)...")
     for _ in range(5):
-        _send_point(cfg, level=700, lat=lat_gas, lon=lon_gas, speed=0)
+        _send_point(cfg, level=630, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
@@ -229,7 +231,7 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_gas + 0.008, lon_gas + 0.008),
     ]
     for lat, lon in trip2_coords:
-        _send_point(cfg, level=700, lat=lat, lon=lon, speed=35)
+        _send_point(cfg, level=630, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
     # -------------------------------------------------------------
@@ -237,21 +239,21 @@ def send_canary_events(cfg: dict) -> datetime:
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 4: Стоянка під злив (315 с > 300 с)...")
     for _ in range(2):
-        _send_point(cfg, level=700, lat=lat_drain, lon=lon_drain, speed=0)
+        _send_point(cfg, level=630, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
-    # Злив пального (-300 л): з 700 до 400 л за 195 с (13 точок по 15 с)
+    # Злив пального (-300 л): з 630 до 330 л за 195 с (13 точок по 15 с)
     log.info(">>> ЕТАП 4.1: Плавний злив (-300 л)...")
     drain_step = 300.0 / 13
     for i in range(1, 14):
-        lvl = 700 - drain_step * i
+        lvl = 630 - drain_step * i
         _send_point(cfg, level=lvl, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # Плато після зливу: 90 с (6 точок по 15 с)
-    log.info(">>> ЕТАП 4.2: Плато після зливу (400 л)...")
+    log.info(">>> ЕТАП 4.2: Плато після зливу (330 л)...")
     for _ in range(6):
-        _send_point(cfg, level=400, lat=lat_drain, lon=lon_drain, speed=0)
+        _send_point(cfg, level=330, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
@@ -265,10 +267,10 @@ def send_canary_events(cfg: dict) -> datetime:
         (lat_drain + 0.008, lon_drain + 0.008),
     ]
     for lat, lon in trip3_coords:
-        _send_point(cfg, level=400, lat=lat, lon=lon, speed=35)
+        _send_point(cfg, level=330, lat=lat, lon=lon, speed=35)
         time.sleep(16)
 
-    log.info("Усі точки в реальному часі відправлено успішно!")
+    log.info("Усі точки подвійної заправки та зливу в реальному часі відправлено успішно!")
     return start_time
 
 
@@ -301,7 +303,7 @@ def fetch_history(cfg: dict) -> dict:
             params=cfg["history_query"], 
             timeout=cfg["http_timeout_sec"]
         )
-        if resp.status_code == 401:
+        if resp.status_code in (401, 403):
             refresh_api_token(cfg)
             headers = {"Authorization": f"Bearer {cfg['api_token']}"}
             resp = GLOBAL_SESSION.get(
@@ -329,6 +331,10 @@ def resolve_device_id(cfg: dict) -> None:
         url = f"{cfg['api_base_url']}/devices"
         params = {"search": cfg["device_name"], "per_page": 20}
         resp = GLOBAL_SESSION.get(url, headers=headers, params=params, timeout=cfg["http_timeout_sec"])
+        if resp.status_code in (401, 403):
+            refresh_api_token(cfg)
+            headers = {"Authorization": f"Bearer {cfg['api_token']}"}
+            resp = GLOBAL_SESSION.get(url, headers=headers, params=params, timeout=cfg["http_timeout_sec"])
         if resp.status_code == 200:
             data = resp.json()
             items = data.get("items") or data.get("data") or []
@@ -358,38 +364,37 @@ def extract_event_time(item: dict) -> str:
 
 
 def get_existing_event_ids(cfg: dict) -> set:
-    try:
-        data = fetch_history(cfg)
-        items = data.get("items") or data.get("data") or []
-        return {item["id"] for item in items if isinstance(item, dict) and "id" in item}
-    except Exception:
+    try: 
+        res = fetch_history(cfg)
+        items = res.get("items") or res.get("data") or []
+        return {item.get("id") for item in items if isinstance(item, dict) and item.get("id") is not None}
+    except Exception: 
         return set()
 
 
 def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: set) -> tuple[bool, str]:
-    data = fetch_history(cfg)
-    items = data.get("items") or data.get("data") or []
-    
+    res = fetch_history(cfg)
+    items = res.get("items") or res.get("data") or []
+    refills_found = []
+    drains_found = []
+
     target_name = cfg.get("device_name", "")
     target_id = cfg.get("device_id")
     target_imei = str(cfg.get("tracker_imei", ""))
     target_refill = cfg["template_refill"].lower().rstrip(":")
     target_drain = cfg["template_drain"].lower().rstrip(":")
 
-    refills_found = []
-    drains_found = []
-
     for item in items:
-        if not isinstance(item, dict): 
+        if not isinstance(item, dict):
             continue
         event_id = item.get("id")
         if event_id in initial_event_ids: 
             continue
-
+            
         item_str = json.dumps(item, ensure_ascii=False)
         item_lower = item_str.lower()
-        dev_name = str(item.get("deviceName") or "")
         dev_id = item.get("deviceId")
+        dev_name = str(item.get("deviceName") or "")
         unique_id = str(item.get("uniqueId") or "")
         
         raw_type = str(item.get("type", "")).upper()
@@ -397,7 +402,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
         template_name = str(item.get("templateName", "")).lower()
         message = str(item.get("message", "")).lower()
 
-        # 1. Прив'язка до тестового прод-об'єкта (по ID, IMEI, назві АБО по унікальному шаблону об'єкта!)
+        # 1. Прив'язка до об'єкта (по ID, IMEI, назві АБО по унікальному шаблону об'єкта!)
         matched = False
         if target_id and dev_id == target_id:
             matched = True
@@ -416,15 +421,15 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
             or target_drain in item_lower
         ):
             matched = True
-
+            
         if not matched:
             continue
         
-        # 2. Витягуємо об'єм пального
+        # 2. Об'єм пального
         volume = None
         try:
             meta = item.get("metadata", {})
-            if isinstance(meta, str):
+            if isinstance(meta, str): 
                 meta = json.loads(meta)
             if isinstance(meta, dict):
                 volume = meta.get("fuelVolume")
@@ -435,7 +440,7 @@ def check_events_in_history(cfg: dict, start_time: datetime, initial_event_ids: 
                         volume = round(abs(finish - start_val), 2)
         except Exception:
             pass
-
+            
         if volume is None:
             m = re.search(r'об[\'’`]?ємом\s+([\d\.]+)\s*л', str(item.get("message", "")) + " " + item_str, re.I)
             if m:
@@ -545,27 +550,26 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
 
 
 def notify_incident(cfg: dict, detail: str) -> None:
-    text = f"🔴 [Teltonika Double Prod Test] Не спрацювали сповіщення пального!\nОб'єкт: {cfg['device_name']}\n\n{detail}"
+    text = f"🔴 [DEV] [Teltonika Double] Не спрацювали сповіщення пального!\nОб'єкт: {cfg['device_name']}\n\n{detail}"
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
 
 
 def notify_recovery(cfg: dict, detail: str) -> None:
-    text = f"🟢 [Teltonika Double Prod Test] Сповіщення пального відновилися!\nОб'єкт: {cfg['device_name']}\n\n{detail}"
+    text = f"🟢 [DEV] [Teltonika Double] Сповіщення пального відновилися!\nОб'єкт: {cfg['device_name']}\n\n{detail}"
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
 
 
 def notify_success(cfg: dict, detail: str) -> None:
-    text = f"✅ [Teltonika Double Prod Test] Подвійна заправка та Злив на проді працюють коректно!\nОб'єкт: {cfg['device_name']}\n\n{detail}"
+    text = f"✅ [DEV] [Teltonika Double] Подвійна заправка та Злив працюють коректно!\nОб'єкт: {cfg['device_name']}\n\n{detail}"
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_chat_id"], text)
     send_telegram(cfg["telegram_bot_token"], cfg["telegram_dm_chat_id"], text)
 
 
 def main() -> int:
     cfg, state = CONFIG, load_state(CONFIG)
-    log.info("Запуск Canary Teltonika Double Prod Test для %s (IMEI: %s, Server: %s:%d)...", 
-             cfg["device_name"], cfg["tracker_imei"], cfg["ingest_host"], cfg["ingest_port"])
+    log.info("Запуск Canary Teltonika Double для %s (IMEI: %s)...", cfg["device_name"], cfg["tracker_imei"])
     resolve_device_id(cfg)
     initial_ids = get_existing_event_ids(cfg)
     

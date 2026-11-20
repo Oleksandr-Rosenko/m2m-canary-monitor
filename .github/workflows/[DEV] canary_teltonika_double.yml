@@ -1,4 +1,4 @@
-name: Canary Monitor (Teltonika Double Refill & Drain)
+name: '[DEV] Canary Monitor (Teltonika Double Refill & Drain)'
 
 on:
   schedule:
@@ -27,12 +27,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script (Teltonika Double)
+      - name: Run Canary Script ([DEV] Teltonika Double)
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
           M2M_API_TOKEN: ${{ secrets.M2M_API_TOKEN }}
+          M2M_API_BASE_URL: https://dev-stag.m2m.eu/api
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
-        run: python canary_teltonika_double.py
+        run: python "[DEV] canary_teltonika_double.py"

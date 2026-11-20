@@ -1,4 +1,4 @@
-name: Canary Monitor (Teltonika Double Refill & Drain - Prod Test)
+name: '[PROD] Canary Monitor (Teltonika Double Refill & Drain)'
 
 on:
   workflow_dispatch:
@@ -24,12 +24,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script (Teltonika Double Prod Test)
+      - name: Run Canary Script ([PROD] Teltonika Double)
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
           M2M_API_TOKEN: ${{ secrets.M2M_API_TOKEN }}
+          M2M_API_BASE_URL: https://my.m2m.eu/api
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
-        run: python canary_teltonika_double_prod.py
+        run: python "[PROD] canary_teltonika_double.py"
