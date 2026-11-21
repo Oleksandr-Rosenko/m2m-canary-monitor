@@ -46,9 +46,9 @@ CONFIG = {
     "template_refill": "Заправка (Сценарій 1 - Single)",
     "template_drain": "Злив (Сценарій 1 - Single)",
     
-    "geo_lat": 49.438923,
-    "geo_lon": 32.085565,
-    "altitude": 10,
+    "geo_lat": 51.201641,
+    "geo_lon": 23.892584,
+    "altitude": 178,
     "bearing": 210, 
     "sat": 12,      
 
@@ -62,7 +62,7 @@ CONFIG = {
 
     "initial_wait_sec": 60,
     "poll_interval_sec": 20,
-    "max_wait_sec": 2100,
+    "max_wait_sec": 1200,
     "http_timeout_sec": 60,  
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -165,95 +165,141 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0)
 
 def send_canary_events(cfg: dict) -> datetime:
     start_time = datetime.now(timezone.utc)
-    lat_gas, lon_gas = cfg["geo_lat"], cfg["geo_lon"]
-    lat_drain, lon_drain = lat_gas + 0.009, lon_gas + 0.009
+    
+    # Координати АЗС біля М-07 (Римачі / Ягодин, Волинська обл. з реального треку):
+    lat_gas, lon_gas = 51.201641, 23.892584
+    # Координати другого пункту зупинки для зливу (далі по трасі М-07):
+    lat_drain, lon_drain = 51.206059, 23.925201
 
     # -------------------------------------------------------------
-    # 1. ПОЇЗДКА 1 (Під'їзд до АЗС): тривалість ~64 с, дистанція > 500 м
+    # 1. ПОЇЗДКА 1 (Під'їзд до АЗС по М-07): плавне гальмування
+    # Тривалість: ~65 с, дистанція > 1.5 км
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 1: Поїздка до АЗС (> 60 с, > 100 м, швидкість 35 км/год)...")
-    trip1_coords = [
-        (lat_gas - 0.006, lon_gas - 0.006),
-        (lat_gas - 0.004, lon_gas - 0.004),
-        (lat_gas - 0.002, lon_gas - 0.002),
-        (lat_gas - 0.001, lon_gas - 0.001),
+    log.info(">>> ЕТАП 1: Під'їзд до АЗС по трасі М-07 (гальмування з 70 до 0 км/год)...")
+    approach_points = [
+        (51.197353, 23.857990, 70, 1025),
+        (51.199303, 23.872787, 65, 1028),
+        (51.200611, 23.882740, 45, 1032),
+        (51.201313, 23.888157, 25, 1035),
     ]
-    for lat, lon in trip1_coords:
-        _send_point(cfg, level=400, lat=lat, lon=lon, speed=35)
+    for lat, lon, spd, lvl in approach_points:
+        _send_point(cfg, level=lvl, lat=lat, lon=lon, speed=spd)
         time.sleep(16)
 
     # -------------------------------------------------------------
-    # 2. СТОЯНКА 1 (АЗС, Заправка): тривалість 390 с (6.5 хв > 300 с!)
-    # Швидкість 0, рух 0, запалювання 1, координати константні!
+    # 2. СТОЯНКА 1 (АЗС, Реалістична східчаста заправка):
+    # Загальна тривалість: ~420 с (7.0 хв > 300 с для Детектора стоянок M2M)
+    # Швидкість 0, рух 0, запалювання 1
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 2: Стоянка під заправку (390 с > 300 с для Детектора поїздок)...")
-    # Базова полиця: 45 с (3 точки по 15 с)
-    for _ in range(3):
-        _send_point(cfg, level=400, lat=lat_gas, lon=lon_gas, speed=0)
-        time.sleep(15)
-
-    # Налив пального (+300 л): 15 точок по 15 с (225 с / 3.75 хв)
-    log.info(">>> ЕТАП 2.1: Плавний налив (+300 л, від 400 до 700 л)...")
-    step = 300.0 / 15
-    for i in range(1, 16):
-        lvl = 400 + step * i
+    log.info(">>> ЕТАП 2: Стоянка на АЗС під заправку (> 300 с)...")
+    
+    # 2.1. Передзаправна полиця (очікування на колонці) з природними коливаннями ДРП:
+    # 6 точок по 15 с = 90 с
+    log.info(">>> ЕТАП 2.1: Передзаправна полиця з природною флуктуацією ДРП (~1010-1038)...")
+    pre_refill_noise = [1010, 1025, 1032, 1036, 1038, 1038]
+    for lvl in pre_refill_noise:
         _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # Плато стабілізації: 120 с (8 точок по 15 с)
-    log.info(">>> ЕТАП 2.2: Плато стабілізації (700 л)...")
+    # 2.2. Налив фаза 1 (первинний напір пістолета, стрибок до ~1609):
+    # 3 точки по 15 с = 45 с
+    log.info(">>> ЕТАП 2.2: Налив фаза 1 (зростання 1038 -> 1609)...")
+    stage1_levels = [1225, 1420, 1609]
+    for lvl in stage1_levels:
+        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
+        time.sleep(15)
+
+    # 2.3. Проміжна полиця / пауза 1 (відсічка пістолета або пауза наливу):
+    # 2 точки по 15 с = 30 с
+    log.info(">>> ЕТАП 2.3: Проміжна полиця на 1609...")
+    for _ in range(2):
+        _send_point(cfg, level=1609, lat=lat_gas, lon=lon_gas, speed=0)
+        time.sleep(15)
+
+    # 2.4. Налив фаза 2 (основний об'єм до ~3005):
+    # 4 точки по 15 с = 60 с
+    log.info(">>> ЕТАП 2.4: Налив фаза 2 (зростання 1609 -> 3005)...")
+    stage2_levels = [1955, 2355, 2765, 3005]
+    for lvl in stage2_levels:
+        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
+        time.sleep(15)
+
+    # 2.5. Проміжна полиця / пауза 2:
+    # 2 точки по 15 с = 30 с
+    log.info(">>> ЕТАП 2.5: Проміжна полиця на 3005...")
+    for _ in range(2):
+        _send_point(cfg, level=3005, lat=lat_gas, lon=lon_gas, speed=0)
+        time.sleep(15)
+
+    # 2.6. Налив фаза 3 (долив під кришку до ~3685):
+    # 3 точки по 15 с = 45 с
+    log.info(">>> ЕТАП 2.6: Налив фаза 3 (долив до повного бака 3005 -> 3685)...")
+    stage3_levels = [3260, 3510, 3685]
+    for lvl in stage3_levels:
+        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
+        time.sleep(15)
+
+    # 2.7. Фінальне плато стабілізації після заправки:
+    # 8 точок по 15 с = 120 с
+    log.info(">>> ЕТАП 2.7: Фінальне плато стабілізації повного бака (3685)...")
     for _ in range(8):
-        _send_point(cfg, level=700, lat=lat_gas, lon=lon_gas, speed=0)
+        _send_point(cfg, level=3685, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
-    # 3. ПОЇЗДКА 2 (Закриття стоянки заправки): ~64 с, дистанція > 500 м
+    # 3. ПОЇЗДКА 2 (Виїзд з АЗС на трасу М-07, закриває стоянку заправки):
+    # Тривалість: ~65 с, дистанція > 1.5 км, швидкість до 75 км/год
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 3: Виїзд з АЗС (закриває стоянку заправки в M2M)...")
-    trip2_coords = [
-        (lat_gas + 0.002, lon_gas + 0.002),
-        (lat_gas + 0.004, lon_gas + 0.004),
-        (lat_gas + 0.006, lon_gas + 0.006),
-        (lat_gas + 0.008, lon_gas + 0.008),
+    log.info(">>> ЕТАП 3: Виїзд з АЗС на трасу М-07 (закриває стоянку заправки в M2M)...")
+    depart_points = [
+        (51.201660, 23.892738, 15, 3685),
+        (51.202324, 23.896040, 45, 3689),
+        (51.203232, 23.902967, 65, 3685),
+        (51.204708, 23.914114, 75, 3680),
     ]
-    for lat, lon in trip2_coords:
-        _send_point(cfg, level=700, lat=lat, lon=lon, speed=35)
+    for lat, lon, spd, lvl in depart_points:
+        _send_point(cfg, level=lvl, lat=lat, lon=lon, speed=spd)
         time.sleep(16)
 
     # -------------------------------------------------------------
-    # 4. СТОЯНКА 2 (Злив): тривалість 390 с (6.5 хв > 300 с!)
+    # 4. СТОЯНКА 2 (Пункт відстою, Злив пального):
+    # Загальна тривалість: ~330 с (5.5 хв > 300 с)
+    # Швидкість 0, рух 0, координати константні
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 4: Стоянка під злив (390 с > 300 с)...")
+    log.info(">>> ЕТАП 4: Стоянка під злив пального (> 300 с)...")
+    # 4.1. Передзливна полиця: 45 с (3 точки по 15 с)
     for _ in range(3):
-        _send_point(cfg, level=700, lat=lat_drain, lon=lon_drain, speed=0)
+        _send_point(cfg, level=3685, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
-    # Злив пального (-300 л): 15 точок по 15 с (225 с / 3.75 хв)
-    log.info(">>> ЕТАП 4.1: Плавний злив (-300 л, від 700 до 400 л)...")
-    drain_step = 300.0 / 15
-    for i in range(1, 16):
-        lvl = 700 - drain_step * i
+    # 4.2. Плавний злив пального (з 3685 до 1850 raw units / ~180-200 л):
+    # 10 точок по 15 с = 150 с
+    log.info(">>> ЕТАП 4.1: Плавний злив пального (3685 -> 1850)...")
+    drain_step = (3685 - 1850) / 10.0
+    for i in range(1, 11):
+        lvl = int(3685 - drain_step * i)
         _send_point(cfg, level=lvl, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
-    # Плато після зливу: 120 с (8 точок по 15 с)
-    log.info(">>> ЕТАП 4.2: Плато після зливу (400 л)...")
-    for _ in range(8):
-        _send_point(cfg, level=400, lat=lat_drain, lon=lon_drain, speed=0)
+    # 4.3. Плато стабілізації після зливу: 9 точок по 15 с = 135 с
+    log.info(">>> ЕТАП 4.2: Плато стабілізації після зливу (1850)...")
+    for _ in range(9):
+        _send_point(cfg, level=1850, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
-    # 5. ПОЇЗДКА 3 (Закриття стоянки зливу): ~64 с, дистанція > 500 м
+    # 5. ПОЇЗДКА 3 (Від'їзд зі стоянки зливу, закриває сесію зливу):
+    # Тривалість: ~65 с, дистанція > 1.5 км
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 5: Від'їзд зі стоянки (закриває стоянку зливу в M2M)...")
-    trip3_coords = [
-        (lat_drain + 0.002, lon_drain + 0.002),
-        (lat_drain + 0.004, lon_drain + 0.004),
-        (lat_drain + 0.006, lon_drain + 0.006),
-        (lat_drain + 0.008, lon_drain + 0.008),
+    log.info(">>> ЕТАП 5: Від'їзд зі стоянки зливу (закриває сесію зливу в M2M)...")
+    drain_depart_points = [
+        (51.206028, 23.927141, 35, 1850),
+        (51.205265, 23.930920, 55, 1852),
+        (51.204517, 23.932686, 75, 1848),
+        (51.202877, 23.936026, 80, 1850),
     ]
-    for lat, lon in trip3_coords:
-        _send_point(cfg, level=400, lat=lat, lon=lon, speed=35)
+    for lat, lon, spd, lvl in drain_depart_points:
+        _send_point(cfg, level=lvl, lat=lat, lon=lon, speed=spd)
         time.sleep(16)
 
     log.info("Усі точки в реальному часі відправлено успішно!")
@@ -421,31 +467,45 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
         item_str = json.dumps(item, ensure_ascii=False)
         item_lower = item_str.lower()
         dev_id = item.get("deviceId")
-        dev_name = str(item.get("deviceName") or "")
-        unique_id = str(item.get("uniqueId") or "")
+        dev_name = str(item.get("deviceName") or "").strip()
+        unique_id = str(item.get("uniqueId") or "").strip()
         
         raw_type = str(item.get("type", "")).upper()
         template_type = str(item.get("templateType", "")).upper()
         template_name = str(item.get("templateName", "")).lower()
         message = str(item.get("message", "")).lower()
 
-        # 1. Прив'язка до об'єкта (по ID, IMEI, назві АБО по унікальному шаблону об'єкта!)
+        # СУВОРЕ ВІДСІКАННЯ ЧУЖИХ СЦЕНАРІЇВ:
+        # Для Single обов'язково відкидаємо події з Double або Prod!
+        if (
+            "double" in dev_name.lower()
+            or dev_name.lower().endswith("_double")
+            or "double" in template_name
+            or "сценарій 2" in template_name
+            or "refill_drain_unit_double" in message
+            or "test_notification_o.rosenko" in dev_name.lower()
+        ):
+            continue
+
+        # 1. Прив'язка до об'єкта (строгий exact match або унікальний шаблон Single):
         matched = False
         if target_id and dev_id == target_id:
             matched = True
         elif target_imei and (unique_id == target_imei or target_imei in item_str):
             matched = True
+        elif target_name and dev_name.lower() == target_name.lower():
+            matched = True
         elif target_name and (
-            target_name.lower() in dev_name.lower()
-            or target_name.lower() in message
-            or target_name.lower() in item_lower
+            f" {target_name.lower()} " in message
+            or f" {target_name.lower()}." in message
+            or f" {target_name.lower()}:" in message
+            or f"'{target_name.lower()}'" in message
+            or f"\"{target_name.lower()}\"" in message
         ):
             matched = True
         elif (
-            target_refill in template_name
-            or target_drain in template_name
-            or target_refill in item_lower
-            or target_drain in item_lower
+            (target_refill in template_name or target_drain in template_name)
+            and "double" not in template_name
         ):
             matched = True
             
@@ -506,14 +566,16 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
     report_lines = []
     if len(refills_found) >= 1:
         t_str = f" (час: {refills_found[0]['time']})" if refills_found[0].get("time") else ""
-        v_str = f": +{refills_found[0]['volume']} л" if refills_found[0].get("volume") is not None else ""
+        vol = refills_found[0].get("volume")
+        v_str = f": +{vol:.2f} л" if isinstance(vol, (int, float)) else (f": +{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Заправка{v_str}{t_str}")
     else:
         report_lines.append("❌ Заправка")
 
     if len(drains_found) >= 1:
         t_str = f" (час: {drains_found[0]['time']})" if drains_found[0].get("time") else ""
-        v_str = f": -{drains_found[0]['volume']} л" if drains_found[0].get("volume") is not None else ""
+        vol = drains_found[0].get("volume")
+        v_str = f": -{vol:.2f} л" if isinstance(vol, (int, float)) else (f": -{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Злив{v_str}{t_str}")
     else:
         report_lines.append("❌ Злив")

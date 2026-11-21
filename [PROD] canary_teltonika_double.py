@@ -63,7 +63,7 @@ CONFIG = {
 
     "initial_wait_sec": 60,
     "poll_interval_sec": 20,
-    "max_wait_sec": 2100,
+    "max_wait_sec": 1200,
     "http_timeout_sec": 60,  
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
@@ -440,23 +440,34 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
         template_name = str(item.get("templateName", "")).lower()
         message = str(item.get("message", "")).lower()
 
-        # 1. Прив'язка до тестового прод-об'єкта (по ID, IMEI, назві АБО по унікальному шаблону об'єкта!)
+        # СУВОРЕ ВІДСІКАННЯ ЧУЖИХ СЦЕНАРІЇВ:
+        # Для Prod обов'язково відкидаємо об'єкти Dev (Refill_Drain_UNIT)!
+        if (
+            "refill_drain_unit" in dev_name.lower()
+            or "refill_drain_unit" in message
+            or "сценарій 1" in template_name
+            or "сценарій 2" in template_name
+            or "single" in template_name
+        ):
+            continue
+
+        # 1. Прив'язка до тестового прод-об'єкта (по ID, IMEI, точній назві АБО по унікальному шаблону об'єкта!)
         matched = False
         if target_id and dev_id == target_id:
             matched = True
         elif target_imei and (unique_id == target_imei or target_imei in item_str):
             matched = True
+        elif target_name and dev_name.strip().lower() == target_name.strip().lower():
+            matched = True
         elif target_name and (
-            target_name.lower() in dev_name.lower()
-            or target_name.lower() in message
-            or target_name.lower() in item_lower
+            f" {target_name.lower()} " in message
+            or f" {target_name.lower()}." in message
+            or f" {target_name.lower()}:" in message
         ):
             matched = True
         elif (
             target_refill in template_name
             or target_drain in template_name
-            or target_refill in item_lower
-            or target_drain in item_lower
         ):
             matched = True
 
@@ -519,7 +530,8 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
     # Заправка 1
     if len(refills_found) >= 1:
         t_str = f" (час: {refills_found[0]['time']})" if refills_found[0].get("time") else ""
-        v_str = f": +{refills_found[0]['volume']} л" if refills_found[0].get("volume") is not None else ""
+        vol = refills_found[0].get("volume")
+        v_str = f": +{vol:.2f} л" if isinstance(vol, (int, float)) else (f": +{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Заправка 1{v_str}{t_str}")
     else:
         report_lines.append("❌ Заправка 1")
@@ -527,7 +539,8 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
     # Заправка 2
     if len(refills_found) >= 2:
         t_str = f" (час: {refills_found[1]['time']})" if refills_found[1].get("time") else ""
-        v_str = f": +{refills_found[1]['volume']} л" if refills_found[1].get("volume") is not None else ""
+        vol = refills_found[1].get("volume")
+        v_str = f": +{vol:.2f} л" if isinstance(vol, (int, float)) else (f": +{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Заправка 2{v_str}{t_str}")
     else:
         report_lines.append("❌ Заправка 2")
@@ -535,7 +548,8 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
     # Злив
     if len(drains_found) >= 1:
         t_str = f" (час: {drains_found[0]['time']})" if drains_found[0].get("time") else ""
-        v_str = f": -{drains_found[0]['volume']} л" if drains_found[0].get("volume") is not None else ""
+        vol = drains_found[0].get("volume")
+        v_str = f": -{vol:.2f} л" if isinstance(vol, (int, float)) else (f": -{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Злив{v_str}{t_str}")
     else:
         report_lines.append("❌ Злив")
