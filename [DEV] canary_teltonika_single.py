@@ -63,7 +63,7 @@ CONFIG = {
 
     "initial_wait_sec": 60,
     "poll_interval_sec": 20,
-    "max_wait_sec": 600,
+    "max_wait_sec": 1200,
     "http_timeout_sec": 60,  
     
     "telegram_bot_token": os.getenv("TELEGRAM_BOT_TOKEN", ""),
