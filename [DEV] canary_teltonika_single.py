@@ -163,7 +163,30 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0)
             time.sleep(delay)
 
 
-def send_canary_events(cfg: dict) -> datetime:
+def select_refill_variant(cfg: dict, state: dict) -> tuple[int, str]:
+    """
+    Визначає варіант тривалості заправки з циклічною ротацією:
+    Варіант 0: до 5 хвилин (~4 хв, об'єм ~355 л)
+    Варіант 1: ~7 хвилин (~7 хв, об'єм ~650 л)
+    Варіант 2: 10+ хвилин (~10.5 хв, об'єм ~860 л)
+    """
+    gh_run = os.getenv("GITHUB_RUN_NUMBER")
+    if gh_run and gh_run.isdigit():
+        variant_idx = (int(gh_run) - 1) % 3
+    else:
+        variant_idx = state.get("refill_variant", 0) % 3
+        state["refill_variant"] = (variant_idx + 1) % 3
+        save_state(cfg, state)
+    
+    variant_names = [
+        "Варіант 1 (до 5 хв, ~355 л)", 
+        "Варіант 2 (~7 хв, ~650 л)", 
+        "Варіант 3 (10+ хв, ~860 л)"
+    ]
+    return variant_idx, variant_names[variant_idx]
+
+
+def send_canary_events(cfg: dict, variant_idx: int = 0) -> datetime:
     start_time = datetime.now(timezone.utc)
     
     # Координати АЗС біля М-07 (Римачі / Ягодин, Волинська обл. з реального треку):
@@ -171,16 +194,60 @@ def send_canary_events(cfg: dict) -> datetime:
     # Координати другого пункту зупинки для зливу (далі по трасі М-07):
     lat_drain, lon_drain = 51.206059, 23.925201
 
+    # Налаштування профілю заправки відповідно до обраного варіанту (об'єм строго до 1000 л)
+    if variant_idx == 0:
+        # Варіант 1: ДО 5 ХВИЛИН (налив ~4 хв, чистий об'єм +355 л)
+        start_level = 95
+        final_level = 450
+        shelf_pre_count = 4    # 60 с
+        phase1_levels = [165, 235, 305, 350]               # 4 точки = 60 с
+        pause1_count = 2                                    # 30 с на 350
+        phase2_levels = [375, 400, 420, 435, 445]          # 5 точок = 75 с
+        pause2_count = 2                                    # 30 с на 445
+        phase3_levels = [448, 449, 450]                    # 3 точки = 45 с
+        shelf_top_count = 4    # 60 с
+        # Час наливу: 60 + 30 + 75 + 30 + 45 = 240 с (4 хв 00 с < 5 хв)
+        # Загальна стоянка: 60 + 240 + 60 = 360 с (6.0 хв > 300 с)
+        log.info(">>> ОБРАНО ПРОФІЛЬ ЗАПРАВКИ: ВАРІАНТ 1 (до 5 хв, об'єм +355 л: 95 -> 450)...")
+    elif variant_idx == 1:
+        # Варіант 2: 7 ХВИЛИН (налив ~7 хв, чистий об'єм +650 л)
+        start_level = 110
+        final_level = 760
+        shelf_pre_count = 4    # 60 с
+        phase1_levels = [200, 290, 380, 460, 520, 560]     # 6 точок = 90 с
+        pause1_count = 3                                    # 45 с на 560
+        phase2_levels = [590, 620, 650, 680, 705, 725, 740, 750]  # 8 точок = 120 с
+        pause2_count = 3                                    # 45 с на 750
+        phase3_levels = [752, 754, 756, 758, 759, 760, 760, 760]  # 8 точок = 120 с
+        shelf_top_count = 4    # 60 с
+        # Час наливу: 90 + 45 + 120 + 45 + 120 = 420 с (7 хв 00 с)
+        # Загальна стоянка: 60 + 420 + 60 = 540 с (9.0 хв > 300 с)
+        log.info(">>> ОБРАНО ПРОФІЛЬ ЗАПРАВКИ: ВАРІАНТ 2 (~7 хв, об'єм +650 л: 110 -> 760)...")
+    else:
+        # Варіант 3: 10+ ХВИЛИН (налив ~10.5 хв, чистий об'єм +860 л)
+        start_level = 85
+        final_level = 945
+        shelf_pre_count = 4    # 60 с
+        phase1_levels = [170, 255, 340, 420, 500, 570, 630, 680, 720, 750]  # 10 точок = 150 с
+        pause1_count = 4                                                     # 60 с на 750
+        phase2_levels = [770, 790, 810, 830, 850, 868, 884, 898, 910, 920, 928, 935]  # 12 точок = 180 с
+        pause2_count = 4                                                     # 60 с на 935
+        phase3_levels = [937, 939, 941, 942, 943, 944, 944, 945, 945, 945, 945, 945]  # 12 точок = 180 с
+        shelf_top_count = 4    # 60 с
+        # Час наливу: 150 + 60 + 180 + 60 + 180 = 630 с (10 хв 30 с = 10+ хв)
+        # Загальна стоянка: 60 + 630 + 60 = 750 с (12.5 хв > 300 с)
+        log.info(">>> ОБРАНО ПРОФІЛЬ ЗАПРАВКИ: ВАРІАНТ 3 (10+ хв, об'єм +860 л: 85 -> 945)...")
+
     # -------------------------------------------------------------
     # 1. ПОЇЗДКА 1 (Під'їзд до АЗС по М-07): плавне гальмування
     # Тривалість: ~65 с, дистанція > 1.5 км
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 1: Під'їзд до АЗС по трасі М-07 (гальмування з 70 до 0 км/год)...")
     approach_points = [
-        (51.197353, 23.857990, 70, 1025),
-        (51.199303, 23.872787, 65, 1028),
-        (51.200611, 23.882740, 45, 1032),
-        (51.201313, 23.888157, 25, 1035),
+        (51.197353, 23.857990, 70, start_level),
+        (51.199303, 23.872787, 65, start_level),
+        (51.200611, 23.882740, 45, start_level),
+        (51.201313, 23.888157, 25, start_level),
     ]
     for lat, lon, spd, lvl in approach_points:
         _send_point(cfg, level=lvl, lat=lat, lon=lon, speed=spd)
@@ -188,62 +255,51 @@ def send_canary_events(cfg: dict) -> datetime:
 
     # -------------------------------------------------------------
     # 2. СТОЯНКА 1 (АЗС, Реалістична східчаста заправка):
-    # Загальна тривалість: ~420 с (7.0 хв > 300 с для Детектора стоянок M2M)
+    # Тривалість > 300 с для Детектора стоянок M2M
     # Швидкість 0, рух 0, запалювання 1
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 2: Стоянка на АЗС під заправку (> 300 с)...")
+    log.info(">>> ЕТАП 2: Стоянка на АЗС під заправку...")
     
-    # 2.1. Передзаправна полиця (очікування на колонці) з природними коливаннями ДРП:
-    # 6 точок по 15 с = 90 с
-    log.info(">>> ЕТАП 2.1: Передзаправна полиця з природною флуктуацією ДРП (~1010-1038)...")
-    pre_refill_noise = [1010, 1025, 1032, 1036, 1038, 1038]
-    for lvl in pre_refill_noise:
+    # 2.1. Передзаправна полиця:
+    log.info(">>> ЕТАП 2.1: Передзаправна полиця на рівні %d л (%d с)...", start_level, shelf_pre_count * 15)
+    for _ in range(shelf_pre_count):
+        _send_point(cfg, level=start_level, lat=lat_gas, lon=lon_gas, speed=0)
+        time.sleep(15)
+
+    # 2.2. Налив фаза 1:
+    log.info(">>> ЕТАП 2.2: Налив фаза 1 (до %d л)...", phase1_levels[-1])
+    for lvl in phase1_levels:
         _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # 2.2. Налив фаза 1 (первинний напір пістолета, стрибок до ~1609):
-    # 3 точки по 15 с = 45 с
-    log.info(">>> ЕТАП 2.2: Налив фаза 1 (зростання 1038 -> 1609)...")
-    stage1_levels = [1225, 1420, 1609]
-    for lvl in stage1_levels:
+    # 2.3. Пауза 1:
+    log.info(">>> ЕТАП 2.3: Пауза 1 на рівні %d л (%d с)...", phase1_levels[-1], pause1_count * 15)
+    for _ in range(pause1_count):
+        _send_point(cfg, level=phase1_levels[-1], lat=lat_gas, lon=lon_gas, speed=0)
+        time.sleep(15)
+
+    # 2.4. Налив фаза 2:
+    log.info(">>> ЕТАП 2.4: Налив фаза 2 (до %d л)...", phase2_levels[-1])
+    for lvl in phase2_levels:
         _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # 2.3. Проміжна полиця / пауза 1 (відсічка пістолета або пауза наливу):
-    # 2 точки по 15 с = 30 с
-    log.info(">>> ЕТАП 2.3: Проміжна полиця на 1609...")
-    for _ in range(2):
-        _send_point(cfg, level=1609, lat=lat_gas, lon=lon_gas, speed=0)
+    # 2.5. Пауза 2:
+    log.info(">>> ЕТАП 2.5: Пауза 2 на рівні %d л (%d с)...", phase2_levels[-1], pause2_count * 15)
+    for _ in range(pause2_count):
+        _send_point(cfg, level=phase2_levels[-1], lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # 2.4. Налив фаза 2 (основний об'єм до ~3005):
-    # 4 точки по 15 с = 60 с
-    log.info(">>> ЕТАП 2.4: Налив фаза 2 (зростання 1609 -> 3005)...")
-    stage2_levels = [1955, 2355, 2765, 3005]
-    for lvl in stage2_levels:
+    # 2.6. Налив фаза 3 (долив):
+    log.info(">>> ЕТАП 2.6: Налив фаза 3 (долив до %d л)...", final_level)
+    for lvl in phase3_levels:
         _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
-    # 2.5. Проміжна полиця / пауза 2:
-    # 2 точки по 15 с = 30 с
-    log.info(">>> ЕТАП 2.5: Проміжна полиця на 3005...")
-    for _ in range(2):
-        _send_point(cfg, level=3005, lat=lat_gas, lon=lon_gas, speed=0)
-        time.sleep(15)
-
-    # 2.6. Налив фаза 3 (долив під кришку до ~3685):
-    # 3 точки по 15 с = 45 с
-    log.info(">>> ЕТАП 2.6: Налив фаза 3 (долив до повного бака 3005 -> 3685)...")
-    stage3_levels = [3260, 3510, 3685]
-    for lvl in stage3_levels:
-        _send_point(cfg, level=lvl, lat=lat_gas, lon=lon_gas, speed=0)
-        time.sleep(15)
-
-    # 2.7. Фінальне плато стабілізації після заправки:
-    # 8 точок по 15 с = 120 с
-    log.info(">>> ЕТАП 2.7: Фінальне плато стабілізації повного бака (3685)...")
-    for _ in range(8):
-        _send_point(cfg, level=3685, lat=lat_gas, lon=lon_gas, speed=0)
+    # 2.7. Фінальне плато стабілізації повного бака:
+    log.info(">>> ЕТАП 2.7: Фінальне плато стабілізації на %d л (%d с)...", final_level, shelf_top_count * 15)
+    for _ in range(shelf_top_count):
+        _send_point(cfg, level=final_level, lat=lat_gas, lon=lon_gas, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
@@ -252,10 +308,10 @@ def send_canary_events(cfg: dict) -> datetime:
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 3: Виїзд з АЗС на трасу М-07 (закриває стоянку заправки в M2M)...")
     depart_points = [
-        (51.201660, 23.892738, 15, 3685),
-        (51.202324, 23.896040, 45, 3689),
-        (51.203232, 23.902967, 65, 3685),
-        (51.204708, 23.914114, 75, 3680),
+        (51.201660, 23.892738, 15, final_level),
+        (51.202324, 23.896040, 45, final_level),
+        (51.203232, 23.902967, 65, final_level),
+        (51.204708, 23.914114, 75, final_level),
     ]
     for lat, lon, spd, lvl in depart_points:
         _send_point(cfg, level=lvl, lat=lat, lon=lon, speed=spd)
@@ -263,28 +319,29 @@ def send_canary_events(cfg: dict) -> datetime:
 
     # -------------------------------------------------------------
     # 4. СТОЯНКА 2 (Пункт відстою, Злив пального):
-    # Загальна тривалість: ~330 с (5.5 хв > 300 с)
-    # Швидкість 0, рух 0, координати константні
+    # Загальна тривалість: ~315 с (> 300 с)
+    # Злив пального на ~210 л (строго до 1000 л)
     # -------------------------------------------------------------
-    log.info(">>> ЕТАП 4: Стоянка під злив пального (> 300 с)...")
+    drain_level = max(50, final_level - 210)
+    log.info(">>> ЕТАП 4: Стоянка під злив пального (%d -> %d л, тривалість > 300 с)...", final_level, drain_level)
+    
     # 4.1. Передзливна полиця: 45 с (3 точки по 15 с)
     for _ in range(3):
-        _send_point(cfg, level=3685, lat=lat_drain, lon=lon_drain, speed=0)
+        _send_point(cfg, level=final_level, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
-    # 4.2. Плавний злив пального (з 3685 до 1850 raw units / ~180-200 л):
-    # 10 точок по 15 с = 150 с
-    log.info(">>> ЕТАП 4.1: Плавний злив пального (3685 -> 1850)...")
-    drain_step = (3685 - 1850) / 10.0
-    for i in range(1, 11):
-        lvl = int(3685 - drain_step * i)
+    # 4.2. Плавний злив пального: 8 точок по 15 с = 120 с
+    log.info(">>> ЕТАП 4.1: Плавний злив пального (%d -> %d л)...", final_level, drain_level)
+    drain_step = (final_level - drain_level) / 8.0
+    for i in range(1, 9):
+        lvl = int(final_level - drain_step * i)
         _send_point(cfg, level=lvl, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
-    # 4.3. Плато стабілізації після зливу: 9 точок по 15 с = 135 с
-    log.info(">>> ЕТАП 4.2: Плато стабілізації після зливу (1850)...")
-    for _ in range(9):
-        _send_point(cfg, level=1850, lat=lat_drain, lon=lon_drain, speed=0)
+    # 4.3. Плато стабілізації після зливу: 10 точок по 15 с = 150 с
+    log.info(">>> ЕТАП 4.2: Плато стабілізації після зливу (%d л)...", drain_level)
+    for _ in range(10):
+        _send_point(cfg, level=drain_level, lat=lat_drain, lon=lon_drain, speed=0)
         time.sleep(15)
 
     # -------------------------------------------------------------
@@ -293,10 +350,10 @@ def send_canary_events(cfg: dict) -> datetime:
     # -------------------------------------------------------------
     log.info(">>> ЕТАП 5: Від'їзд зі стоянки зливу (закриває сесію зливу в M2M)...")
     drain_depart_points = [
-        (51.206028, 23.927141, 35, 1850),
-        (51.205265, 23.930920, 55, 1852),
-        (51.204517, 23.932686, 75, 1848),
-        (51.202877, 23.936026, 80, 1850),
+        (51.206028, 23.927141, 35, drain_level),
+        (51.205265, 23.930920, 55, drain_level),
+        (51.204517, 23.932686, 75, drain_level),
+        (51.202877, 23.936026, 80, drain_level),
     ]
     for lat, lon, spd, lvl in drain_depart_points:
         _send_point(cfg, level=lvl, lat=lat, lon=lon, speed=spd)
@@ -425,6 +482,85 @@ def extract_event_time(item: dict) -> str:
     return ""
 
 
+def extract_event_duration(item: dict) -> str:
+    msg = str(item.get("message") or "")
+    
+    # 1. Пошук тривалості у повідомленні ("тривалість: 00:04:15" або "тривалістю 4 хв")
+    m_dur = re.search(r'триваліст[^\:\d]*[:\s]+([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)', msg, re.I)
+    if m_dur:
+        raw_dur = m_dur.group(1)
+        parts = [int(p) for p in raw_dur.split(":")]
+        if len(parts) == 3:
+            h, m, s = parts
+            res = []
+            if h > 0: res.append(f"{h} год")
+            if m > 0 or h > 0: res.append(f"{m} хв")
+            res.append(f"{s} с")
+            return " ".join(res)
+        elif len(parts) == 2:
+            m, s = parts
+            return f"{m} хв {s} с"
+        return raw_dur
+
+    m_text = re.search(r'триваліст[^\:\d]*[:\s]+([\d\.]+\s*(?:хв|год|с|сек))', msg, re.I)
+    if m_text:
+        return m_text.group(1).strip()
+
+    # 2. Пошук у metadata
+    try:
+        meta = item.get("metadata", {})
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        if isinstance(meta, dict):
+            dur = meta.get("duration") or meta.get("eventDuration") or meta.get("fuelDuration")
+            if dur is not None:
+                if isinstance(dur, (int, float)):
+                    sec = int(dur)
+                    if sec > 360000: sec //= 1000
+                    h = sec // 3600
+                    m = (sec % 3600) // 60
+                    s = sec % 60
+                    res = []
+                    if h > 0: res.append(f"{h} год")
+                    if m > 0 or h > 0: res.append(f"{m} хв")
+                    res.append(f"{s} с")
+                    return " ".join(res)
+                elif isinstance(dur, str) and dur.strip():
+                    return dur.strip()
+
+            start_t = meta.get("fuelStartTime") or meta.get("startTime")
+            finish_t = meta.get("fuelFinishTime") or meta.get("finishTime") or meta.get("endTime")
+            if start_t and finish_t and isinstance(start_t, (int, float)) and isinstance(finish_t, (int, float)):
+                diff_s = int(abs(finish_t - start_t))
+                if diff_s > 360000: diff_s //= 1000
+                h = diff_s // 3600
+                m = (diff_s % 3600) // 60
+                s = diff_s % 60
+                res = []
+                if h > 0: res.append(f"{h} год")
+                if m > 0 or h > 0: res.append(f"{m} хв")
+                res.append(f"{s} с")
+                return " ".join(res)
+    except Exception:
+        pass
+
+    # 3. Пошук у кореневих полях item
+    dur = item.get("duration") or item.get("eventDuration")
+    if dur is not None and isinstance(dur, (int, float)):
+        sec = int(dur)
+        if sec > 360000: sec //= 1000
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        res = []
+        if h > 0: res.append(f"{h} год")
+        if m > 0 or h > 0: res.append(f"{m} хв")
+        res.append(f"{s} с")
+        return " ".join(res)
+
+    return ""
+
+
 def get_existing_event_ids(cfg: dict) -> tuple[set, int]:
     try: 
         res = fetch_history(cfg)
@@ -537,6 +673,7 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
                     pass
 
         ev_time = extract_event_time(item)
+        ev_dur = extract_event_duration(item)
 
         # 3. Ідентифікація типу події
         if (
@@ -548,7 +685,7 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
             or "заправк" in message
         ):
             if not any(r["id"] == event_id for r in refills_found):
-                refills_found.append({"id": event_id, "volume": volume, "time": ev_time})
+                refills_found.append({"id": event_id, "volume": volume, "time": ev_time, "duration": ev_dur})
         elif (
             raw_type in ("DRAIN",)
             or template_type in ("DRAIN",)
@@ -558,14 +695,19 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
             or "злив" in message
         ):
             if not any(d["id"] == event_id for d in drains_found):
-                drains_found.append({"id": event_id, "volume": volume, "time": ev_time})
+                drains_found.append({"id": event_id, "volume": volume, "time": ev_time, "duration": ev_dur})
 
     refills_found.sort(key=lambda x: x["id"])
     drains_found.sort(key=lambda x: x["id"])
 
     report_lines = []
     if len(refills_found) >= 1:
-        t_str = f" (час: {refills_found[0]['time']})" if refills_found[0].get("time") else ""
+        t_parts = []
+        if refills_found[0].get("time"):
+            t_parts.append(f"час: {refills_found[0]['time']}")
+        if refills_found[0].get("duration"):
+            t_parts.append(f"тривалість: {refills_found[0]['duration']}")
+        t_str = f" ({', '.join(t_parts)})" if t_parts else ""
         vol = refills_found[0].get("volume")
         v_str = f": +{vol:.2f} л" if isinstance(vol, (int, float)) else (f": +{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Заправка{v_str}{t_str}")
@@ -573,7 +715,12 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
         report_lines.append("❌ Заправка")
 
     if len(drains_found) >= 1:
-        t_str = f" (час: {drains_found[0]['time']})" if drains_found[0].get("time") else ""
+        t_parts = []
+        if drains_found[0].get("time"):
+            t_parts.append(f"час: {drains_found[0]['time']}")
+        if drains_found[0].get("duration"):
+            t_parts.append(f"тривалість: {drains_found[0]['duration']}")
+        t_str = f" ({', '.join(t_parts)})" if t_parts else ""
         vol = drains_found[0].get("volume")
         v_str = f": -{vol:.2f} л" if isinstance(vol, (int, float)) else (f": -{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Злив{v_str}{t_str}")
@@ -650,13 +797,16 @@ def main() -> int:
     log.info("Запуск Canary Teltonika Single для %s (IMEI: %s)...", cfg["device_name"], cfg["tracker_imei"])
     resolve_device_id(cfg)
     
+    variant_idx, variant_name = select_refill_variant(cfg, state)
+    log.info("Параметри запуску: %s", variant_name)
+
     start_ts = time.time()
     initial_ids, max_initial_id = get_existing_event_ids(cfg)
     log.info("Фіксація старту: %d наявних сповіщень в історії (max_id=%s, start_ts=%.0f)", 
              len(initial_ids), max_initial_id, start_ts)
     
     try:
-        send_canary_events(cfg)
+        send_canary_events(cfg, variant_idx)
     except Exception as e:
         notify_incident(cfg, f"Помилка відправки точок по TCP: {e}")
         return 1

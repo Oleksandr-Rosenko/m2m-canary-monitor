@@ -389,6 +389,85 @@ def extract_event_time(item: dict) -> str:
     return ""
 
 
+def extract_event_duration(item: dict) -> str:
+    msg = str(item.get("message") or "")
+    
+    # 1. Пошук тривалості у повідомленні ("тривалість: 00:04:15" або "тривалістю 4 хв")
+    m_dur = re.search(r'триваліст[^\:\d]*[:\s]+([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)', msg, re.I)
+    if m_dur:
+        raw_dur = m_dur.group(1)
+        parts = [int(p) for p in raw_dur.split(":")]
+        if len(parts) == 3:
+            h, m, s = parts
+            res = []
+            if h > 0: res.append(f"{h} год")
+            if m > 0 or h > 0: res.append(f"{m} хв")
+            res.append(f"{s} с")
+            return " ".join(res)
+        elif len(parts) == 2:
+            m, s = parts
+            return f"{m} хв {s} с"
+        return raw_dur
+
+    m_text = re.search(r'триваліст[^\:\d]*[:\s]+([\d\.]+\s*(?:хв|год|с|сек))', msg, re.I)
+    if m_text:
+        return m_text.group(1).strip()
+
+    # 2. Пошук у metadata
+    try:
+        meta = item.get("metadata", {})
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        if isinstance(meta, dict):
+            dur = meta.get("duration") or meta.get("eventDuration") or meta.get("fuelDuration")
+            if dur is not None:
+                if isinstance(dur, (int, float)):
+                    sec = int(dur)
+                    if sec > 360000: sec //= 1000
+                    h = sec // 3600
+                    m = (sec % 3600) // 60
+                    s = sec % 60
+                    res = []
+                    if h > 0: res.append(f"{h} год")
+                    if m > 0 or h > 0: res.append(f"{m} хв")
+                    res.append(f"{s} с")
+                    return " ".join(res)
+                elif isinstance(dur, str) and dur.strip():
+                    return dur.strip()
+
+            start_t = meta.get("fuelStartTime") or meta.get("startTime")
+            finish_t = meta.get("fuelFinishTime") or meta.get("finishTime") or meta.get("endTime")
+            if start_t and finish_t and isinstance(start_t, (int, float)) and isinstance(finish_t, (int, float)):
+                diff_s = int(abs(finish_t - start_t))
+                if diff_s > 360000: diff_s //= 1000
+                h = diff_s // 3600
+                m = (diff_s % 3600) // 60
+                s = diff_s % 60
+                res = []
+                if h > 0: res.append(f"{h} год")
+                if m > 0 or h > 0: res.append(f"{m} хв")
+                res.append(f"{s} с")
+                return " ".join(res)
+    except Exception:
+        pass
+
+    # 3. Пошук у кореневих полях item
+    dur = item.get("duration") or item.get("eventDuration")
+    if dur is not None and isinstance(dur, (int, float)):
+        sec = int(dur)
+        if sec > 360000: sec //= 1000
+        h = sec // 3600
+        m = (sec % 3600) // 60
+        s = sec % 60
+        res = []
+        if h > 0: res.append(f"{h} год")
+        if m > 0 or h > 0: res.append(f"{m} хв")
+        res.append(f"{s} с")
+        return " ".join(res)
+
+    return ""
+
+
 def get_existing_event_ids(cfg: dict) -> tuple[set, int]:
     try:
         data = fetch_history(cfg)
@@ -499,6 +578,7 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
                     pass
 
         ev_time = extract_event_time(item)
+        ev_dur = extract_event_duration(item)
 
         # 3. Ідентифікація типу події
         if (
@@ -510,7 +590,7 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
             or "заправк" in message
         ):
             if not any(r["id"] == event_id for r in refills_found):
-                refills_found.append({"id": event_id, "volume": volume, "time": ev_time})
+                refills_found.append({"id": event_id, "volume": volume, "time": ev_time, "duration": ev_dur})
         elif (
             raw_type in ("DRAIN",)
             or template_type in ("DRAIN",)
@@ -520,7 +600,7 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
             or "злив" in message
         ):
             if not any(d["id"] == event_id for d in drains_found):
-                drains_found.append({"id": event_id, "volume": volume, "time": ev_time})
+                drains_found.append({"id": event_id, "volume": volume, "time": ev_time, "duration": ev_dur})
 
     refills_found.sort(key=lambda x: x["id"])
     drains_found.sort(key=lambda x: x["id"])
@@ -529,7 +609,12 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
     
     # Заправка 1
     if len(refills_found) >= 1:
-        t_str = f" (час: {refills_found[0]['time']})" if refills_found[0].get("time") else ""
+        t_parts = []
+        if refills_found[0].get("time"):
+            t_parts.append(f"час: {refills_found[0]['time']}")
+        if refills_found[0].get("duration"):
+            t_parts.append(f"тривалість: {refills_found[0]['duration']}")
+        t_str = f" ({', '.join(t_parts)})" if t_parts else ""
         vol = refills_found[0].get("volume")
         v_str = f": +{vol:.2f} л" if isinstance(vol, (int, float)) else (f": +{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Заправка 1{v_str}{t_str}")
@@ -538,7 +623,12 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
 
     # Заправка 2
     if len(refills_found) >= 2:
-        t_str = f" (час: {refills_found[1]['time']})" if refills_found[1].get("time") else ""
+        t_parts = []
+        if refills_found[1].get("time"):
+            t_parts.append(f"час: {refills_found[1]['time']}")
+        if refills_found[1].get("duration"):
+            t_parts.append(f"тривалість: {refills_found[1]['duration']}")
+        t_str = f" ({', '.join(t_parts)})" if t_parts else ""
         vol = refills_found[1].get("volume")
         v_str = f": +{vol:.2f} л" if isinstance(vol, (int, float)) else (f": +{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Заправка 2{v_str}{t_str}")
@@ -547,7 +637,12 @@ def check_events_in_history(cfg: dict, start_ts: float, initial_event_ids: set, 
 
     # Злив
     if len(drains_found) >= 1:
-        t_str = f" (час: {drains_found[0]['time']})" if drains_found[0].get("time") else ""
+        t_parts = []
+        if drains_found[0].get("time"):
+            t_parts.append(f"час: {drains_found[0]['time']}")
+        if drains_found[0].get("duration"):
+            t_parts.append(f"тривалість: {drains_found[0]['duration']}")
+        t_str = f" ({', '.join(t_parts)})" if t_parts else ""
         vol = drains_found[0].get("volume")
         v_str = f": -{vol:.2f} л" if isinstance(vol, (int, float)) else (f": -{vol} л" if vol is not None else "")
         report_lines.append(f"✅ Злив{v_str}{t_str}")
