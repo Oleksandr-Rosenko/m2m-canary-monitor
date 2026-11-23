@@ -114,53 +114,43 @@ def _send_point(cfg: dict, level: float, lat: float, lon: float, speed: int = 0)
     io_data.append(0)  # Event IO ID
     io_data.append(3)  # Total IO elements: 3
 
-    # 1-byte elements: Ignition (239) and Movement (240)
+    # 1-byte IOs: Movement (240) та Ignition (239)
     io_data.append(2)
-    io_data.extend(struct.pack(">B B", 239, 1 if speed == 0 else 1))
-    io_data.extend(struct.pack(">B B", 240, 0 if speed == 0 else 1))
+    io_data.append(240)
+    io_data.append(1 if speed > 0 else 0)
+    io_data.append(239)
+    io_data.append(1)  # ЗАПАЛЮВАННЯ 1
 
-    # 2-byte elements: Fuel Level Sensor 1 (LLS 1, IO ID 270)
+    # 2-byte IOs: Fuel level (201)
     io_data.append(1)
-    io_data.extend(struct.pack(">B H", 270, int(round(level))))
+    io_data.append(201)
+    io_data.extend(struct.pack(">h", int(round(level))))
 
     # 4-byte and 8-byte elements: 0
     io_data.append(0)
     io_data.append(0)
 
-    record = avl_data + io_data
-    payload = bytearray()
-    payload.append(8)   # Codec ID: 0x08
-    payload.append(1)   # Number of Data 1
-    payload.extend(record)
-    payload.append(1)   # Number of Data 2
+    data_part8 = bytearray([0x08, 1]) + avl_data + io_data + bytearray([1])
+    crc8 = crc16_arc(data_part8)
+    packet_c8 = bytearray(b'\x00\x00\x00\x00') + struct.pack(">I", len(data_part8)) + data_part8 + struct.pack(">I", crc8)
 
-    data_field = bytes(payload)
-    data_length = len(data_field)
-    crc = crc16_arc(data_field)
-    packet = struct.pack(">I I", 0, data_length) + data_field + struct.pack(">I", crc)
+    log.info("Teltonika: Fuel=%.2f л, Speed=%d км/год, Ignition=1 (lat=%.5f, lon=%.5f)",
+             level, speed, lat, lon)
 
-    max_retries = 3
+    max_retries = 5
     for attempt in range(1, max_retries + 1):
         try:
-            with socket.create_connection((host, port), timeout=15) as s:
-                imei_bytes = imei.encode("ascii")
-                imei_packet = struct.pack(">H", len(imei_bytes)) + imei_bytes
-                s.sendall(imei_packet)
-                resp = s.recv(1)
+            with socket.create_connection((host, port), timeout=cfg["http_timeout_sec"]) as sock:
+                imei_b = imei.encode('ascii')
+                sock.sendall(struct.pack(">H", len(imei_b)) + imei_b)
+                resp = sock.recv(1)
                 if not resp or resp[0] != 1:
-                    raise ConnectionError(f"IMEI handshake rejected: resp={resp}")
-
-                s.sendall(packet)
-                ack = s.recv(4)
-                if len(ack) < 4:
-                    raise ConnectionError("Не отримано коректний ACK від сервера")
-                accepted = struct.unpack(">I", ack)[0]
-                if accepted != 1:
-                    log.warning("Сервер повернув ACK=%d (очікувався 1)", accepted)
-                log.info("Точка успішно доставлена: рівень=%.2f л, lat=%.6f, lon=%.6f, spd=%d",
-                         level, lat, lon, speed)
-                return
-        except Exception as e:
+                    log.warning("Handshake не підтверджено сервером: %s", resp)
+                    return
+                sock.sendall(packet_c8)
+                sock.recv(4)
+            return
+        except (socket.error, OSError) as e:
             if attempt == max_retries:
                 log.error("TCP Error вичерпано всі спроби (%d): %s", max_retries, e)
                 raise
@@ -854,6 +844,7 @@ def main() -> int:
     try:
         send_canary_events(cfg)
     except Exception as e:
+        log.error("Критична помилка в send_canary_events: %s", e, exc_info=True)
         notify_incident(cfg, f"Помилка відправки точок по TCP: {e}")
         return 1
 
