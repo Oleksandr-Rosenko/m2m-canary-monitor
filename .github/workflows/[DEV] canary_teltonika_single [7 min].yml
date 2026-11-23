@@ -1,13 +1,13 @@
-name: '[DEV] Canary Monitor (Teltonika Single Refill & Drain)'
+name: '[DEV] Canary Monitor (Teltonika Single Refill & Drain) [7 min]'
 
 on:
   schedule:
-    # Запускається на 7-й хвилині кожної 3-ї години (02:07, 05:07, 08:07... за Києвом)
-    - cron: '7 0,3,6,9,12,15,18,21 * * *'
+    # Запускається на 7-й хвилині кожної 3-ї години (04:07, 07:07, 10:07... за Києвом)
+    - cron: '7 2,5,8,11,14,17,20,23 * * *'
   workflow_dispatch:
 
 jobs:
-  run-canary-teltonika-single:
+  run-canary-teltonika-single-7m:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Kyiv
@@ -27,7 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script ([DEV] Teltonika Single)
+      - name: Run Canary Script ([DEV] Teltonika Single [7 min])
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
@@ -36,4 +36,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
-        run: python "[DEV] canary_teltonika_single.py"
+        run: python "[DEV] canary_teltonika_single [7 min].py"
