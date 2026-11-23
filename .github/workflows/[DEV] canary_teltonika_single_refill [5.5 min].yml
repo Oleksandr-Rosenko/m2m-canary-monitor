@@ -2,8 +2,8 @@ name: '[DEV] Canary Monitor (Teltonika Single Refill Only) [5.5 min]'
 
 on:
   schedule:
-    # 3-годинна ротація: 02:07, 05:07, 08:07, 11:07, 14:07, 17:07, 20:07, 23:07 (за Києвом/UTC)
-    - cron: '7 2,5,8,11,14,17,20,23 * * *'
+    # Запускається раз на годину на початку години (щогодини о :05 за UTC/Києвом)
+    - cron: '5 * * * *'
   workflow_dispatch:
 
 jobs:
