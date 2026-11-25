@@ -1,7 +1,7 @@
-name: '[DEV] Canary Monitor (Teltonika 5h Deep Check: MAN + 4130 + Drain)'
+name: '[DEV] 3_canary_single_5h_deep [5h]'
 
 on:
-  # Окремий ручний запуск для перевірки 3-год лівого краю фіксу WEB-2433 (не перетинається з короткими прогонами).
+  # Окремий ручний запуск для перевірки 3-год лівого краю (MAN + 4130 + Drain + 3.2h хвіст).
   # За потреби нічного автозапуску (00:30 за Києвом) можна розкоментувати schedule нижче:
   # schedule:
   #   - cron: '30 0 * * *'
@@ -12,23 +12,24 @@ permissions:
   actions: read
 
 jobs:
-  run-canary-teltonika-long-5h:
+  run-3-canary-single-5h-deep:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     env:
       TZ: Europe/Kyiv
 
     steps:
-      - name: Wait if Short Single Canary is currently running on device 47613
+      - name: Wait if [DEV] 1_canary_single_2refills_drain is running on 47613
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python - <<'EOF'
-          import json, os, time, urllib.request
+          import json, os, time, urllib.parse, urllib.request
 
           repo = os.environ["GITHUB_REPOSITORY"]
           token = os.environ["GH_TOKEN"]
-          url = f"https://api.github.com/repos/{repo}/actions/workflows/%5BDEV%5D%20canary_teltonika_single_2refill_drain.yml/runs?per_page=3"
+          wf = urllib.parse.quote("[DEV] 1_canary_single_2refills_drain.yml")
+          url = f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/runs?per_page=3"
           deadline = time.monotonic() + 3000  # чекаємо максимум 50 хв завершення короткого запуску
           while time.monotonic() < deadline:
               try:
@@ -41,9 +42,9 @@ jobs:
                       runs = json.loads(r.read().decode()).get("workflow_runs", [])
                   active = [x for x in runs if x.get("status") in ("in_progress", "queued", "waiting")]
                   if not active:
-                      print("Device 47613 is free. Starting 5h Deep Check.")
+                      print("Device 47613 is free. Starting [DEV] 3_canary_single_5h_deep.py.")
                       break
-                  print(f"Waiting for Short Single run #{active[0].get('id')} ({active[0].get('status')})...")
+                  print(f"Waiting for [DEV] 1_canary_single run #{active[0].get('id')} ({active[0].get('status')})...")
               except Exception as exc:
                   print(f"Guard check error (proceeding): {exc}")
                   break
@@ -64,7 +65,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script ([DEV] Teltonika 5h Deep Check)
+      - name: Run [DEV] 3_canary_single_5h_deep.py
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
@@ -73,4 +74,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
-        run: python "[DEV] canary_teltonika_long_5h.py"
+        run: python "[DEV] 3_canary_single_5h_deep.py"

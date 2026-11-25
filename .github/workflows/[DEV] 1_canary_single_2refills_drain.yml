@@ -1,4 +1,4 @@
-name: '[DEV] Canary Monitor (Teltonika Single: 2 Refills + Trip + Drain)'
+name: '[DEV] 1_canary_single_2refills_drain [43m]'
 
 on:
   schedule:
@@ -11,24 +11,25 @@ permissions:
   actions: read
 
 jobs:
-  run-canary-teltonika-single-2refill-drain:
+  run-1-canary-single-2refills-drain:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Kyiv
 
     steps:
-      - name: Guard against 5h Deep Check collision on device 47613
+      - name: Guard against [DEV] 3_canary_single_5h_deep collision on 47613
         id: guard
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python - <<'EOF'
-          import json, os, urllib.request
+          import json, os, urllib.parse, urllib.request
           from datetime import datetime, timezone
 
           repo = os.environ["GITHUB_REPOSITORY"]
           token = os.environ["GH_TOKEN"]
-          url = f"https://api.github.com/repos/{repo}/actions/workflows/%5BDEV%5D%20canary_teltonika_long_5h.yml/runs?per_page=5"
+          wf = urllib.parse.quote("[DEV] 3_canary_single_5h_deep.yml")
+          url = f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/runs?per_page=5"
           req = urllib.request.Request(url, headers={
               "Authorization": f"Bearer {token}",
               "Accept": "application/vnd.github+json",
@@ -42,7 +43,7 @@ jobs:
               for run in runs:
                   st = run.get("status")
                   if st in ("in_progress", "queued", "waiting"):
-                      print(f"5h Deep Check run #{run.get('id')} is active ({st}) -> skipping.")
+                      print(f"5h run #{run.get('id')} is active ({st}) -> skipping.")
                       skip = True
                       break
                   upd = run.get("updated_at")
@@ -50,7 +51,7 @@ jobs:
                       dt = datetime.fromisoformat(upd.replace("Z", "+00:00"))
                       age_min = (now - dt).total_seconds() / 60.0
                       if age_min < 210.0:
-                          print(f"5h Deep Check run #{run.get('id')} finished {age_min:.1f}m ago (<210m) -> skipping.")
+                          print(f"5h run #{run.get('id')} finished {age_min:.1f}m ago (<210m) -> skipping.")
                           skip = True
                           break
           except Exception as exc:
@@ -77,7 +78,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script ([DEV] Teltonika Single 2x Refill + Drain)
+      - name: Run [DEV] 1_canary_single_2refills_drain.py
         if: steps.guard.outputs.skip != 'true'
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
@@ -87,4 +88,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
-        run: python "[DEV] canary_teltonika_single_2refill_drain.py"
+        run: python "[DEV] 1_canary_single_2refills_drain.py"

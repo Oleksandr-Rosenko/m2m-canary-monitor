@@ -36,7 +36,7 @@ CONFIG = {
     "report_id": 1180,
     "tracker_imei": "68162416785325812345",
     "scenario_mode": "double",
-    "scenario_label": "[DEV] [Teltonika Double 1316+Drain]",
+    "scenario_label": "[DEV] 2_canary_double_1316_drain [47m]",
 
     "ingest_host": "95.217.119.27",
     "ingest_port": 5027,

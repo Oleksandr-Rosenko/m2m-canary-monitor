@@ -1,4 +1,4 @@
-name: '[DEV] Canary Monitor (Teltonika Double: 1316 Back-to-Back Refills + Drain)'
+name: '[DEV] 2_canary_double_1316_drain [47m]'
 
 on:
   schedule:
@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  run-canary-teltonika-double:
+  run-2-canary-double-1316-drain:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Kyiv
@@ -27,7 +27,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script ([DEV] Teltonika Double 1316 + Drain)
+      - name: Run [DEV] 2_canary_double_1316_drain.py
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
@@ -36,4 +36,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
-        run: python "[DEV] canary_teltonika_double.py"
+        run: python "[DEV] 2_canary_double_1316_drain.py"

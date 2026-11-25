@@ -34,7 +34,7 @@ CONFIG = {
     "report_id": 1180,
     "tracker_imei": "12345678901234567890",
     "scenario_mode": "single",
-    "scenario_label": "[DEV] [Teltonika Single 2xRefill+Drain]",
+    "scenario_label": "[DEV] 1_canary_single_2refills_drain [43m]",
 
     "ingest_host": "95.217.119.27",
     "ingest_port": 5027,

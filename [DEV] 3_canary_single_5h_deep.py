@@ -37,7 +37,7 @@ CONFIG = {
     "report_id": 1180,
     "tracker_imei": "12345678901234567890",
     "scenario_mode": "single",
-    "scenario_label": "[DEV] [Teltonika 5h Deep Check: MAN+4130+Drain]",
+    "scenario_label": "[DEV] 3_canary_single_5h_deep [5h]",
 
     "ingest_host": "95.217.119.27",
     "ingest_port": 5027,
