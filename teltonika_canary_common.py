@@ -686,6 +686,18 @@ def collect_history_events(
             or "triple" in template_name or "quatro" in template_name
         ):
             continue
+        elif scenario_mode == "triple" and (
+            "single" in template_name or "сценарій 1" in template_name
+            or "double" in template_name or "сценарій 2" in template_name
+            or "quatro" in template_name
+        ):
+            continue
+        elif scenario_mode == "quatro" and (
+            "single" in template_name or "сценарій 1" in template_name
+            or "double" in template_name or "сценарій 2" in template_name
+            or "triple" in template_name
+        ):
+            continue
 
         matched = False
         if target_id and dev_id == target_id:
@@ -702,13 +714,14 @@ def collect_history_events(
             or f'"{target_name.lower()}"' in message
         ):
             matched = True
-        elif scenario_mode in ("single", "double") and (
-            (target_refill and target_refill in template_name)
-            or (target_drain and target_drain in template_name)
-        ):
-            if scenario_mode == "single" and "double" not in template_name:
+        elif (target_refill and target_refill in template_name) or (target_drain and target_drain in template_name):
+            if scenario_mode == "single" and not any(w in template_name for w in ("double", "triple", "quatro")):
                 matched = True
-            elif scenario_mode == "double" and "single" not in template_name:
+            elif scenario_mode == "double" and not any(w in template_name for w in ("single", "triple", "quatro")):
+                matched = True
+            elif scenario_mode == "triple" and "triple" in template_name:
+                matched = True
+            elif scenario_mode == "quatro" and "quatro" in template_name:
                 matched = True
 
         if not matched:

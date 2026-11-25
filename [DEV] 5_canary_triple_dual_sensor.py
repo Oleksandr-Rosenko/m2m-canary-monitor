@@ -38,8 +38,8 @@ CONFIG = {
     "ingest_host": "95.217.119.27",
     "ingest_port": 5027,
 
-    "template_refill": "Заправка",
-    "template_drain": "Злив",
+    "template_refill": "Заправка triple",
+    "template_drain": "Злив triple",
     "expected_refills": 4,
     "expected_drains": 2,
 
