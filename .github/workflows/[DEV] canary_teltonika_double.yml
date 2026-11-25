@@ -1,8 +1,8 @@
-name: '[DEV] Canary Monitor (Teltonika Double Refill & Drain)'
+name: '[DEV] Canary Monitor (Teltonika Double: 1316 Back-to-Back Refills + Drain)'
 
 on:
   schedule:
-    # Запускається на 22-й хвилині кожної 3-ї години (02:22, 05:22, 08:22... за Києвом)
+    # Запускається кожні 3 години на 22-й хвилині (00:22, 03:22, 06:22... за Києвом)
     - cron: '22 0,3,6,9,12,15,18,21 * * *'
   workflow_dispatch:
 
@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: Europe/Kyiv
-    
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
@@ -21,13 +21,13 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-          
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script ([DEV] Teltonika Double)
+      - name: Run Canary Script ([DEV] Teltonika Double 1316 + Drain)
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
