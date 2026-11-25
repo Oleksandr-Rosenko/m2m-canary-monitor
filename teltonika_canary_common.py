@@ -325,7 +325,7 @@ def refresh_api_token(cfg: dict) -> None:
         log.warning("Не вдалося оновити токен API: %s", exc)
 
 
-def fetch_history(cfg: dict, page_size: int | None = None, page: int = 1) -> dict:
+def fetch_history(cfg: dict, page_size: int | None = None, page: int = 1, search: str | None = None) -> dict:
     if not cfg.get("api_token"):
         refresh_api_token(cfg)
     headers = {"Authorization": f"Bearer {cfg['api_token']}"}
@@ -333,6 +333,8 @@ def fetch_history(cfg: dict, page_size: int | None = None, page: int = 1) -> dic
     params["page"] = page
     if page_size is not None:
         params["per_page"] = page_size
+    if search:
+        params["search"] = search
     try:
         resp = GLOBAL_SESSION.get(
             f"{cfg['api_base_url']}{cfg['history_path']}",
@@ -357,33 +359,41 @@ def fetch_history(cfg: dict, page_size: int | None = None, page: int = 1) -> dic
 
 
 def fetch_history_since(cfg: dict, start_ts: float, max_pages: int = 6) -> list[dict]:
-    """Вивантажує сторінки історії, поки записи не досягнуть start_ts - 180 с (гарантує повну вибірку)."""
-    all_items: list[dict] = []
-    seen_ids: set = set()
+    """Вивантажує сторінки історії, поки записи не досягнуть start_ts - 180 с (з пошуком по об'єкту і fallback)."""
     per_page = int(cfg.get("history_query", {}).get("per_page", 100) or 100)
     cutoff = start_ts - 180.0
 
-    for page in range(1, max_pages + 1):
-        res = fetch_history(cfg, page_size=per_page, page=page)
-        items = res.get("items") or res.get("data") or []
-        if not items:
-            break
-        oldest_ts = None
-        for it in items:
-            if not isinstance(it, dict):
-                continue
-            eid = it.get("id")
-            if eid is not None and eid in seen_ids:
-                continue
-            if eid is not None:
-                seen_ids.add(eid)
-            all_items.append(it)
-            ts = parse_item_timestamp(it)
-            if ts is not None and (oldest_ts is None or ts < oldest_ts):
-                oldest_ts = ts
-        if len(items) < per_page or (oldest_ts is not None and oldest_ts < cutoff):
-            break
-    return all_items
+    def _pull(search_term: str | None) -> list[dict]:
+        collected: list[dict] = []
+        seen_ids: set = set()
+        for page in range(1, max_pages + 1):
+            res = fetch_history(cfg, page_size=per_page, page=page, search=search_term)
+            items = res.get("items") or res.get("data") or []
+            if not items:
+                break
+            oldest_ts = None
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                eid = it.get("id")
+                if eid is not None and eid in seen_ids:
+                    continue
+                if eid is not None:
+                    seen_ids.add(eid)
+                collected.append(it)
+                ts = parse_item_timestamp(it)
+                if ts is not None and (oldest_ts is None or ts < oldest_ts):
+                    oldest_ts = ts
+            if len(items) < per_page or (oldest_ts is not None and oldest_ts < cutoff):
+                break
+        return collected
+
+    dev_name = str(cfg.get("device_name") or "").strip()
+    if dev_name:
+        targeted = _pull(dev_name)
+        if targeted:
+            return targeted
+    return _pull(None)
 
 
 def resolve_device_id(cfg: dict) -> None:
@@ -674,8 +684,17 @@ def collect_history_events(
 
         if "test_notification_o.rosenko" in dev_name_l:
             continue
-        if dev_name_l in other_unit_names or any(other in message for other in other_unit_names):
-            continue
+        exact_target = (
+            (target_id and dev_id == target_id)
+            or (target_imei and unique_id == target_imei)
+            or (target_name and dev_name_l == target_name.lower())
+        )
+        if not exact_target:
+            if dev_name_l in other_unit_names or any(
+                re.search(rf"(?<![a-z0-9_]){re.escape(other)}(?![a-z0-9_])", message)
+                for other in other_unit_names
+            ):
+                continue
         if scenario_mode == "single" and (
             "double" in template_name or "сценарій 2" in template_name
             or "triple" in template_name or "quatro" in template_name
@@ -699,22 +718,17 @@ def collect_history_events(
         ):
             continue
 
-        matched = False
-        if target_id and dev_id == target_id:
+        matched = bool(exact_target)
+        if not matched and target_imei and target_imei in item_str:
             matched = True
-        elif target_imei and (unique_id == target_imei or target_imei in item_str):
-            matched = True
-        elif target_name and dev_name_l == target_name.lower():
-            matched = True
-        elif target_name and (
-            f" {target_name.lower()} " in message
-            or f" {target_name.lower()}." in message
-            or f" {target_name.lower()}:" in message
-            or f"'{target_name.lower()}'" in message
-            or f'"{target_name.lower()}"' in message
+        elif not matched and target_name and re.search(
+            rf"(?<![a-z0-9_]){re.escape(target_name.lower())}(?![a-z0-9_])",
+            message,
         ):
             matched = True
-        elif (target_refill and target_refill in template_name) or (target_drain and target_drain in template_name):
+        elif not matched and (
+            (target_refill and target_refill in template_name) or (target_drain and target_drain in template_name)
+        ):
             if scenario_mode == "single" and not any(w in template_name for w in ("double", "triple", "quatro")):
                 matched = True
             elif scenario_mode == "double" and not any(w in template_name for w in ("single", "triple", "quatro")):
