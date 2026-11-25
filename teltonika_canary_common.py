@@ -334,6 +334,11 @@ def resolve_device_id(cfg: dict) -> None:
 
 
 def _parse_any_ts(val) -> float | None:
+    if isinstance(val, dict):
+        for key in ("time", "timestamp", "date", "value", "start", "end"):
+            if val.get(key) is not None:
+                return _parse_any_ts(val[key])
+        return None
     if isinstance(val, (int, float)):
         return float(val) / 1000.0 if val > 1e11 else float(val)
     if isinstance(val, str) and val.strip():
@@ -345,7 +350,7 @@ def _parse_any_ts(val) -> float | None:
             return dt.timestamp()
         except Exception:
             pass
-        m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?", txt)
+        m = re.search(r"(\d{2})[./](\d{2})[./](\d{4})\s+(\d{2}):(\d{2})(?::(\d{2}))?", txt)
         if m:
             try:
                 day, month, year, hour, minute = map(int, m.groups()[:5])
@@ -663,7 +668,12 @@ def _cluster_events(events: list[dict], time_gap_sec: float = 180.0, vol_tol: fl
 
 
 def _extract_float(val) -> float | None:
-    if isinstance(val, (int, float)):
+    if isinstance(val, dict):
+        for key in ("value", "volume", "amount"):
+            if val.get(key) is not None:
+                return _extract_float(val[key])
+        return None
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
         return float(val)
     if isinstance(val, str):
         m = re.search(r"[-+]?\d+(?:[.,]\d+)?", val)
@@ -676,14 +686,22 @@ def _extract_float(val) -> float | None:
 
 
 def _normalize_report_row(row, headers: list[str] | None) -> dict:
+    """Нормалізує рядок таблиці звіту M2M v2 (`ReportRow: {row: [...]}` або dict/list) у словник події."""
     if isinstance(row, list) and headers:
         mapped = {str(h): row[i] for i, h in enumerate(headers) if i < len(row)}
-    elif isinstance(row, dict) and isinstance(row.get("cells"), list) and headers:
-        mapped = {str(h): row["cells"][i] for i, h in enumerate(headers) if i < len(row["cells"])}
-    elif isinstance(row, dict) and isinstance(row.get("values"), list) and headers:
-        mapped = {str(h): row["values"][i] for i, h in enumerate(headers) if i < len(row["values"])}
     elif isinstance(row, dict):
-        mapped = row
+        arr = None
+        for arr_key in ("row", "cells", "values", "data"):
+            if isinstance(row.get(arr_key), list):
+                arr = row[arr_key]
+                break
+        if arr is not None:
+            if headers:
+                mapped = {str(h): arr[i] for i, h in enumerate(headers) if i < len(arr)}
+            else:
+                mapped = {f"col_{i}": arr[i] for i in range(len(arr))}
+        else:
+            mapped = row
     else:
         return {}
 
@@ -693,19 +711,40 @@ def _normalize_report_row(row, headers: list[str] | None) -> dict:
     volume = None
     sensor_name = None
 
+    # 1. Пріоритетне точне співставлення стандартних колонок M2M Report v2
+    for exact_key in ("refill_start_time", "drain_start_time", "start_time", "start_interval"):
+        if exact_key in lower_map and start_ts is None:
+            start_ts = _parse_any_ts(lower_map[exact_key])
+    for exact_key in ("refill_end_time", "drain_end_time", "end_time", "end_interval"):
+        if exact_key in lower_map and finish_ts is None:
+            finish_ts = _parse_any_ts(lower_map[exact_key])
+    for exact_key in ("refill_volume", "drain_volume", "volume", "refilled", "total_refill", "total_drain"):
+        if exact_key in lower_map and volume is None:
+            cand = _extract_float(lower_map[exact_key])
+            if cand is not None:
+                volume = abs(cand)
+    if "sensor_name" in lower_map and lower_map["sensor_name"] is not None:
+        sensor_name = str(lower_map["sensor_name"])
+
+    # 2. Fallback для локалізованих/кастомних заголовків (виключаючи локації, лічильники й рівні)
+    _non_vol_words = (
+        "time", "date", "час", "тривал", "duration",
+        "location", "address", "адрес", "місц", "coord", "коорд",
+        "count", "кільк", "level", "рівен", "start", "end", "finish", "почат", "кінец",
+    )
     for k, v in lower_map.items():
         if start_ts is None and any(w in k for w in ("start", "begin", "from", "почат")):
-            if "level" not in k and "value" not in k and "рівен" not in k:
+            if "level" not in k and "value" not in k and "рівен" not in k and "coord" not in k and "loc" not in k:
                 start_ts = _parse_any_ts(v)
         if finish_ts is None and any(w in k for w in ("finish", "end", "to", "кінец", "заверш")):
-            if "level" not in k and "value" not in k and "рівен" not in k:
+            if "level" not in k and "value" not in k and "рівен" not in k and "coord" not in k and "loc" not in k:
                 finish_ts = _parse_any_ts(v)
-        if volume is None and any(w in k for w in ("volume", "vol", "refill", "drain", "об'єм", "обʼєм", "обєм", "заправ", "злив", "кільк")):
-            if "time" not in k and "date" not in k and "час" not in k and "тривал" not in k:
+        if volume is None and any(w in k for w in ("volume", "vol", "об'єм", "обʼєм", "обєм", "refill", "drain", "заправ", "злив")):
+            if not any(nw in k for nw in _non_vol_words):
                 cand = _extract_float(v)
                 if cand is not None:
                     volume = abs(cand)
-        if sensor_name is None and any(w in k for w in ("sensor", "датчик")):
+        if sensor_name is None and any(w in k for w in ("sensor", "датчик")) and v is not None:
             sensor_name = str(v)
 
     return {
@@ -713,89 +752,71 @@ def _normalize_report_row(row, headers: list[str] | None) -> dict:
         "finish_ts": finish_ts,
         "volume": volume,
         "sensor": sensor_name,
-        "raw_keys": list(mapped.keys())[:10],
+        "raw_keys": list(mapped.keys())[:12],
     }
 
 
-def fetch_report_events(cfg: dict, start_ts: float) -> dict:
-    """Виконує звіт v2 і повертає структурований список подій REFILL і DRAIN."""
-    report_id = cfg.get("report_id")
-    device_id = cfg.get("device_id")
-    if not report_id or not device_id:
-        return {"checked": False, "reason": "report_id або device_id не налаштовано"}
+def _flatten_report_rows(items) -> list:
+    """Рекурсивно розгортає `groupedRows` / `nestedRows` таблиці звіту до листкових `ReportRow`."""
+    leaf_rows: list = []
+    if not items:
+        return leaf_rows
+    if isinstance(items, dict):
+        for key in ("ungroupedRows", "nestedRows", "groupedRows", "rows", "items", "data"):
+            if items.get(key):
+                leaf_rows.extend(_flatten_report_rows(items[key]))
+        if not leaf_rows and isinstance(items.get("row"), list):
+            leaf_rows.append(items)
+        return leaf_rows
+    if not isinstance(items, list):
+        return leaf_rows
+    for item in items:
+        if isinstance(item, dict) and ("nestedRows" in item or "groupedBy" in item or item.get("hasNested")):
+            nested = item.get("nestedRows")
+            if nested:
+                leaf_rows.extend(_flatten_report_rows(nested))
+        elif isinstance(item, (dict, list)):
+            leaf_rows.append(item)
+    return leaf_rows
 
-    if not cfg.get("api_token"):
-        refresh_api_token(cfg)
 
-    t_from = datetime.fromtimestamp(start_ts, tz=timezone.utc) - timedelta(minutes=10)
-    t_to = datetime.now(timezone.utc) + timedelta(minutes=5)
-    params = {
-        "elementId": device_id,
-        "dateFrom": t_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "dateTo": t_to.strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    headers = {"Authorization": f"Bearer {cfg['api_token']}"}
-    endpoints = [
-        f"{cfg['api_base_url']}/v2/report/template/{report_id}/execute",
-        f"{cfg['api_base_url']}/report/template/{report_id}/execute",
-    ]
-
-    resp = None
-    last_err = ""
-    for url in endpoints:
-        try:
-            log.info("Запит звіту №%s (elementId=%s)...", report_id, device_id)
-            r = GLOBAL_SESSION.get(url, headers=headers, params=params, timeout=cfg["http_timeout_sec"])
-            if r.status_code in (401, 403):
-                refresh_api_token(cfg)
-                headers = {"Authorization": f"Bearer {cfg['api_token']}"}
-                r = GLOBAL_SESSION.get(url, headers=headers, params=params, timeout=cfg["http_timeout_sec"])
-            if r.status_code == 200:
-                resp = r
-                break
-            last_err = f"HTTP {r.status_code}: {r.text[:120]}"
-        except Exception as exc:
-            last_err = str(exc)
-
-    if resp is None or resp.status_code != 200:
-        log.warning("Не вдалося отримати звіт №%s: %s", report_id, last_err)
-        return {"checked": False, "reason": f"Помилка API ({last_err})"}
-
-    try:
-        data = resp.json()
-    except Exception as exc:
-        return {"checked": False, "reason": f"Некоректний JSON відповіді: {exc}"}
-
+def _parse_report_payload(data: dict, report_id: int | str) -> tuple[list[dict], list[dict], str]:
+    """Витягує події REFILL/DRAIN із `ReportResultDto` і повертає діагностичний опис структури."""
     refills: list[dict] = []
     drains: list[dict] = []
     logged_schema = False
+    table_summaries: list[str] = []
 
-    for tbl in data.get("tables") or []:
+    tables = data.get("tables") or []
+    for tbl in tables:
+        if not isinstance(tbl, dict):
+            continue
         t_type = str(tbl.get("tableType") or "").upper()
         title = str(tbl.get("title") or "").lower()
-        is_refill = "REFILL" in t_type or "заправ" in title
-        is_drain = "DRAIN" in t_type or "злив" in title
+        is_refill = "REFILL" in t_type or "заправ" in title or "refuel" in title
+        is_drain = "DRAIN" in t_type or "злив" in title or "drain" in title
+
+        ungrp = tbl.get("ungroupedRows") or []
+        grp = tbl.get("groupedRows") or []
+        tot = tbl.get("total") or []
+        cols = tbl.get("columns") or tbl.get("labels") or tbl.get("headers") or []
+        table_summaries.append(
+            f"{t_type or title or '?'}(ungrp={len(ungrp)},grp={len(grp)},tot={len(tot)},cols={len(cols)})"
+        )
+
         if not (is_refill or is_drain):
             continue
 
-        raw_cols = tbl.get("columns") or tbl.get("headers") or []
         col_names = [
-            c.get("key") or c.get("field") or c.get("title") or c.get("name") or str(i)
+            c.get("key") or c.get("field") or c.get("name") or c.get("title") or str(i)
             if isinstance(c, dict)
             else str(c)
-            for i, c in enumerate(raw_cols)
+            for i, c in enumerate(cols)
         ]
 
-        rows = list(tbl.get("ungroupedRows") or [])
-        if not rows and tbl.get("groupedRows"):
-            for g in tbl.get("groupedRows"):
-                nested = g.get("nestedRows")
-                if isinstance(nested, list):
-                    rows.extend(nested)
-                elif isinstance(nested, dict):
-                    rows.extend(nested.get("rows", []))
-                else:
-                    rows.append(g)
+        rows = list(ungrp)
+        if not rows and grp:
+            rows = _flatten_report_rows(grp)
 
         for r in rows:
             norm = _normalize_report_row(r, col_names or None)
@@ -810,14 +831,95 @@ def fetch_report_events(cfg: dict, start_ts: float) -> dict:
 
     refills.sort(key=lambda x: x["start_ts"] or 0.0)
     drains.sort(key=lambda x: x["start_ts"] or 0.0)
-    log.info("Результат звіту №%s: заправок=%d, зливів=%d", report_id, len(refills), len(drains))
+    diag = (
+        f"reportType={data.get('reportType')}, elementId={data.get('elementId')}, "
+        f"tables=[{', '.join(table_summaries)}], charts={len(data.get('charts') or [])}"
+    )
+    return refills, drains, diag
+
+
+def fetch_report_events(cfg: dict, start_ts: float) -> dict:
+    """Виконує звіт v2/v1 (пробуючи UI-формат Київ+offset і UTC fallback) і повертає події REFILL/DRAIN."""
+    report_id = cfg.get("report_id")
+    device_id = cfg.get("device_id")
+    if not report_id or not device_id:
+        return {"checked": False, "reason": "report_id або device_id не налаштовано"}
+
+    if not cfg.get("api_token"):
+        refresh_api_token(cfg)
+
+    t_from_utc = datetime.fromtimestamp(start_ts, tz=timezone.utc) - timedelta(minutes=15)
+    t_to_utc = datetime.now(timezone.utc) + timedelta(minutes=10)
+    t_from_kyiv = t_from_utc.astimezone(KYIV_TZ)
+    t_to_kyiv = t_to_utc.astimezone(KYIV_TZ)
+
+    v2_url = f"{cfg['api_base_url']}/v2/report/template/{report_id}/execute"
+    v1_url = f"{cfg['api_base_url']}/report/template/{report_id}/execute"
+
+    # M2M UI (`Xo`) надсилає локальний час із зсувом (+02:00/+03:00); якщо 0 подій — пробуємо UTC Z, naive та v1.
+    attempts = [
+        (v2_url, "v2+kyiv_offset", t_from_kyiv.isoformat(timespec="seconds"), t_to_kyiv.isoformat(timespec="seconds")),
+        (v2_url, "v2+utc_z", t_from_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), t_to_utc.strftime("%Y-%m-%dT%H:%M:%SZ")),
+        (v2_url, "v2+kyiv_naive", t_from_kyiv.strftime("%Y-%m-%dT%H:%M:%S"), t_to_kyiv.strftime("%Y-%m-%dT%H:%M:%S")),
+        (v1_url, "v1+kyiv_offset", t_from_kyiv.isoformat(timespec="seconds"), t_to_kyiv.isoformat(timespec="seconds")),
+        (v1_url, "v1+utc_z", t_from_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), t_to_utc.strftime("%Y-%m-%dT%H:%M:%SZ")),
+    ]
+
+    headers = {"Authorization": f"Bearer {cfg['api_token']}"}
+    last_err = ""
+    any_200 = False
+    best_refills: list[dict] = []
+    best_drains: list[dict] = []
+    best_diag = ""
+    best_mode = ""
+
+    for url, mode_label, d_from, d_to in attempts:
+        params = {"elementId": device_id, "dateFrom": d_from, "dateTo": d_to}
+        try:
+            log.info(
+                "Запит звіту №%s (%s, elementId=%s, %s .. %s)...",
+                report_id, mode_label, device_id, d_from, d_to,
+            )
+            r = GLOBAL_SESSION.get(url, headers=headers, params=params, timeout=cfg["http_timeout_sec"])
+            if r.status_code in (401, 403):
+                refresh_api_token(cfg)
+                headers = {"Authorization": f"Bearer {cfg['api_token']}"}
+                r = GLOBAL_SESSION.get(url, headers=headers, params=params, timeout=cfg["http_timeout_sec"])
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}: {r.text[:120]}"
+                continue
+
+            data = r.json()
+            any_200 = True
+            refills, drains, diag = _parse_report_payload(data, report_id)
+            best_diag = diag
+            best_mode = mode_label
+            if refills or drains:
+                best_refills, best_drains = refills, drains
+                break
+        except Exception as exc:
+            last_err = str(exc)
+
+    if not any_200:
+        log.warning("Не вдалося отримати звіт №%s: %s", report_id, last_err)
+        return {"checked": False, "reason": f"Помилка API ({last_err})"}
+
+    if not best_refills and not best_drains and best_diag:
+        log.warning("Звіт №%s повернув 0 заправок і 0 зливів у всіх форматах! Структура: %s", report_id, best_diag)
+
+    log.info(
+        "Результат звіту №%s [%s]: заправок=%d, зливів=%d",
+        report_id, best_mode or "?", len(best_refills), len(best_drains),
+    )
     return {
         "checked": True,
         "report_id": report_id,
-        "refills": refills,
-        "drains": drains,
-        "refill_count": len(refills),
-        "drain_count": len(drains),
+        "format": best_mode,
+        "diag": best_diag,
+        "refills": best_refills,
+        "drains": best_drains,
+        "refill_count": len(best_refills),
+        "drain_count": len(best_drains),
     }
 
 
@@ -887,9 +989,29 @@ def audit_notifications_vs_report(
             f"отримано {len(rep_refills)} заправок і {len(rep_drains)} зливів"
         )
 
-    def match_group(label: str, rep_events: list[dict], notifs: list[dict], sign: str) -> None:
+    def match_group(label: str, rep_events: list[dict], notifs: list[dict], sign: str, exp_cnt: int) -> None:
         nonlocal has_missing, has_duplicates
         used_notif_ids: set = set()
+
+        if not rep_events and notifs:
+            clusters = _cluster_events(notifs)
+            for idx, cl in enumerate(clusters, 1):
+                n0 = cl[0]
+                n0_vol = n0.get("volume")
+                n0_vol_str = f"{sign}{n0_vol:.1f} л" if n0_vol is not None else "—"
+                t_str = _fmt_ts_kyiv(n0.get("start_ts"))
+                if len(cl) > 1:
+                    has_duplicates = True
+                    lines.append(
+                        f"⚠️ {label} #{idx}: Є В ІСТОРІЇ (ДУБЛЬ x{len(cl)}), НЕМАЄ У ЗВІТІ №{report['report_id']} | алерт: {n0_vol_str} ({t_str})"
+                    )
+                else:
+                    lines.append(
+                        f"⚠️ {label} #{idx}: Є В ІСТОРІЇ, НЕМАЄ У ЗВІТІ №{report['report_id']} | алерт: {n0_vol_str} ({t_str})"
+                    )
+            if len(clusters) > exp_cnt:
+                has_duplicates = True
+            return
 
         for idx, rep_ev in enumerate(rep_events, 1):
             r_start = rep_ev.get("start_ts")
@@ -937,11 +1059,10 @@ def audit_notifications_vs_report(
                     f"алерт: {n0_vol_str} ({_fmt_ts_kyiv(n0.get('start_ts'))}), затримка: {delay_str}"
                 )
 
-        # Шукаємо ДУБЛЬ ЗІ ЗСУВОМ серед неприв'язаних сповіщень
-        for n in notifs:
-            if n["id"] in used_notif_ids:
-                continue
-            has_duplicates = True
+        # Шукаємо неприв'язані сповіщення (ДУБЛЬ ЗІ ЗСУВОМ або розбіжність зі неповним звітом)
+        unmatched = [n for n in notifs if n["id"] not in used_notif_ids]
+        unmatched_clusters = _cluster_events(unmatched) if unmatched else []
+        for n in unmatched:
             n_vol = n.get("volume")
             n_vol_str = f"{sign}{n_vol:.1f} л" if n_vol is not None else "—"
             shifted_from = ""
@@ -951,12 +1072,20 @@ def audit_notifications_vs_report(
                     if rv is not None and abs(rv - n_vol) <= max(10.0, 0.15 * rv):
                         shifted_from = f" (схоже на {label} #{idx}, зсув початку!)"
                         break
-            lines.append(
-                f"⚠️ {label}: ДУБЛЬ ЗІ ЗСУВОМ{shifted_from} | алерт: {n_vol_str} (початок {_fmt_ts_kyiv(n.get('start_ts'))})"
-            )
+            if shifted_from or len(rep_events) >= exp_cnt or len(_cluster_events(notifs)) > exp_cnt:
+                has_duplicates = True
+                lines.append(
+                    f"⚠️ {label}: ДУБЛЬ ЗІ ЗСУВОМ{shifted_from} | алерт: {n_vol_str} (початок {_fmt_ts_kyiv(n.get('start_ts'))})"
+                )
+            else:
+                lines.append(
+                    f"⚠️ {label}: Є В ІСТОРІЇ, НЕ ЗБІГСЯ ЗІ ЗВІТОМ | алерт: {n_vol_str} (початок {_fmt_ts_kyiv(n.get('start_ts'))})"
+                )
+        if any(len(cl) > 1 for cl in unmatched_clusters):
+            has_duplicates = True
 
-    match_group("REFILL", rep_refills, refills_found, "+")
-    match_group("DRAIN", rep_drains, drains_found, "-")
+    match_group("REFILL", rep_refills, refills_found, "+", exp_r)
+    match_group("DRAIN", rep_drains, drains_found, "-", exp_d)
 
     return {
         "ok": (not has_missing) and (not has_duplicates) and len(rep_refills) == exp_r and len(rep_drains) == exp_d,
