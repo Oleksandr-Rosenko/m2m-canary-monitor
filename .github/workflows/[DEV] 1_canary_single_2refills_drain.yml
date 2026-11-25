@@ -2,13 +2,18 @@ name: '[DEV] 1_canary_single_2refills_drain [43m]'
 
 on:
   schedule:
-    # Запускається кожні 3 години на 5-й хвилині (00:05, 03:05, 06:05... за Києвом)
-    - cron: '5 0,3,6,9,12,15,18,21 * * *'
+    # Денний розклад UTC (кожні 3 год вдень, БЕЗ нічного вікна 22:00-05:00 UTC для 5h перевірок):
+    # 05:05, 08:05, 11:05, 14:05, 17:05, 20:05 UTC (= 07:05..22:05 Київ взимку / 08:05..23:05 влітку)
+    - cron: '5 5,8,11,14,17,20 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
   actions: read
+
+concurrency:
+  group: dev-canary-1-single
+  cancel-in-progress: false
 
 jobs:
   run-1-canary-single-2refills-drain:
@@ -17,53 +22,14 @@ jobs:
       TZ: Europe/Kyiv
 
     steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
       - name: Guard against [DEV] 3_canary_single_5h_deep collision on 47613
         id: guard
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          python - <<'EOF'
-          import json, os, urllib.parse, urllib.request
-          from datetime import datetime, timezone
-
-          repo = os.environ["GITHUB_REPOSITORY"]
-          token = os.environ["GH_TOKEN"]
-          wf = urllib.parse.quote("[DEV] 3_canary_single_5h_deep.yml")
-          url = f"https://api.github.com/repos/{repo}/actions/workflows/{wf}/runs?per_page=5"
-          req = urllib.request.Request(url, headers={
-              "Authorization": f"Bearer {token}",
-              "Accept": "application/vnd.github+json",
-              "User-Agent": "canary-guard/1.0",
-          })
-          skip = False
-          try:
-              with urllib.request.urlopen(req, timeout=15) as r:
-                  runs = json.loads(r.read().decode()).get("workflow_runs", [])
-              now = datetime.now(timezone.utc)
-              for run in runs:
-                  st = run.get("status")
-                  if st in ("in_progress", "queued", "waiting"):
-                      print(f"5h run #{run.get('id')} is active ({st}) -> skipping.")
-                      skip = True
-                      break
-                  upd = run.get("updated_at")
-                  if upd:
-                      dt = datetime.fromisoformat(upd.replace("Z", "+00:00"))
-                      age_min = (now - dt).total_seconds() / 60.0
-                      if age_min < 210.0:
-                          print(f"5h run #{run.get('id')} finished {age_min:.1f}m ago (<210m) -> skipping.")
-                          skip = True
-                          break
-          except Exception as exc:
-              print(f"Guard check skipped due to API error (proceeding): {exc}")
-
-          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-              f.write(f"skip={'true' if skip else 'false'}\n")
-          EOF
-
-      - name: Checkout repo
-        if: steps.guard.outputs.skip != 'true'
-        uses: actions/checkout@v3
+        run: python3 workflow_guard.py --target "[DEV] 3_canary_single_5h_deep.yml" --mode skip --cooldown-min 15
 
       - name: Setup Python
         if: steps.guard.outputs.skip != 'true'

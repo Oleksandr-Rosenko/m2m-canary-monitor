@@ -2,9 +2,18 @@ name: '[DEV] 2_canary_double_1316_drain [47m]'
 
 on:
   schedule:
-    # Запускається кожні 3 години на 22-й хвилині (00:22, 03:22, 06:22... за Києвом)
-    - cron: '22 0,3,6,9,12,15,18,21 * * *'
+    # Денний розклад UTC зі зміщенням +1 год від 1_ (ніколи не пересікається ні з 1_, ні з нічним 4_):
+    # 06:05, 09:05, 12:05, 15:05, 18:05, 21:05 UTC (= 08:05..23:05 Київ взимку / 09:05..00:05 влітку)
+    - cron: '5 6,9,12,15,18,21 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: dev-canary-2-double
+  cancel-in-progress: false
 
 jobs:
   run-2-canary-double-1316-drain:
@@ -16,18 +25,27 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v3
 
+      - name: Guard against [DEV] 4_canary_double_5h_deep collision on 47614
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 workflow_guard.py --target "[DEV] 4_canary_double_5h_deep.yml" --mode skip --cooldown-min 15
+
       - name: Setup Python
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.10'
           cache: 'pip'
 
       - name: Install Dependencies
+        if: steps.guard.outputs.skip != 'true'
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
       - name: Run [DEV] 2_canary_double_1316_drain.py
+        if: steps.guard.outputs.skip != 'true'
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
