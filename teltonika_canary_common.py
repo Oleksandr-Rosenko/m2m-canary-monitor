@@ -416,18 +416,28 @@ def resolve_device_id(cfg: dict) -> None:
         log.warning("Не вдалося автоматично визначити device_id: %s", exc)
 
 
+def _normalize_iso_for_py310(txt: str) -> str:
+    """Нормалізує ISO-рядок під Python 3.10 (дробові секунди 1..9 цифр -> 6, Z -> +00:00, +HHMM -> +HH:MM)."""
+    s = txt.strip()
+    if s.endswith(("Z", "z")):
+        s = s[:-1] + "+00:00"
+    s = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", s)
+    s = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
+    return s
+
+
 def _parse_any_ts(val) -> float | None:
     if isinstance(val, dict):
-        for key in ("time", "timestamp", "date", "value", "start", "end"):
+        for key in ("time", "timestamp", "date", "dateTime", "startTime", "endTime", "value", "start", "end"):
             if val.get(key) is not None:
                 return _parse_any_ts(val[key])
         return None
-    if isinstance(val, (int, float)):
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
         return float(val) / 1000.0 if val > 1e11 else float(val)
     if isinstance(val, str) and val.strip():
         txt = val.strip()
         try:
-            dt = datetime.fromisoformat(txt.replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(_normalize_iso_for_py310(txt))
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=KYIV_TZ)
             return dt.timestamp()
@@ -817,9 +827,13 @@ def _normalize_report_row(row, headers: list[str] | None) -> dict:
     for exact_key in ("refill_start_time", "drain_start_time", "start_time", "start_interval"):
         if exact_key in lower_map and start_ts is None:
             start_ts = _parse_any_ts(lower_map[exact_key])
+            if start_ts is None and lower_map[exact_key] not in (None, "", "-"):
+                log.warning("Не вдалося розпарсити %s=%r у рядку звіту", exact_key, lower_map[exact_key])
     for exact_key in ("refill_end_time", "drain_end_time", "end_time", "end_interval"):
         if exact_key in lower_map and finish_ts is None:
             finish_ts = _parse_any_ts(lower_map[exact_key])
+            if finish_ts is None and lower_map[exact_key] not in (None, "", "-"):
+                log.warning("Не вдалося розпарсити %s=%r у рядку звіту", exact_key, lower_map[exact_key])
     for exact_key in ("refill_volume", "drain_volume", "volume", "refilled", "total_refill", "total_drain"):
         if exact_key in lower_map and volume is None:
             cand = _extract_float(lower_map[exact_key])
@@ -931,8 +945,8 @@ def _parse_report_payload(data: dict, report_id: int | str) -> tuple[list[dict],
             else:
                 drains.append(norm)
 
-    refills.sort(key=lambda x: x["start_ts"] or 0.0)
-    drains.sort(key=lambda x: x["start_ts"] or 0.0)
+    refills.sort(key=lambda x: x["start_ts"] if x["start_ts"] is not None else (x["finish_ts"] if x["finish_ts"] is not None else float("inf")))
+    drains.sort(key=lambda x: x["start_ts"] if x["start_ts"] is not None else (x["finish_ts"] if x["finish_ts"] is not None else float("inf")))
     diag = (
         f"reportType={data.get('reportType')}, elementId={data.get('elementId')}, "
         f"tables=[{', '.join(table_summaries)}], charts={len(data.get('charts') or [])}"
@@ -997,7 +1011,16 @@ def fetch_report_events(cfg: dict, start_ts: float) -> dict:
             best_diag = diag
             best_mode = mode_label
             if refills or drains:
-                best_refills, best_drains = refills, drains
+                min_event_ts = start_ts - 120.0
+                r_in = [x for x in refills if x.get("start_ts") is None or x["start_ts"] >= min_event_ts]
+                d_in = [x for x in drains if x.get("start_ts") is None or x["start_ts"] >= min_event_ts]
+                skipped = (len(refills) - len(r_in)) + (len(drains) - len(d_in))
+                if skipped > 0:
+                    log.info(
+                        "Відфільтровано передстартових подій звіту (< start_ts-120s): %d (залишилось R=%d, D=%d)",
+                        skipped, len(r_in), len(d_in),
+                    )
+                best_refills, best_drains = r_in, d_in
                 break
         except Exception as exc:
             last_err = str(exc)
@@ -1128,29 +1151,45 @@ def audit_notifications_vs_report(
                 has_duplicates = True
             return
 
-        for idx, rep_ev in enumerate(rep_events, 1):
+        # Двопрохідна прив'язка: спершу всі події звіту з відомим start_ts, потім fallback без start_ts по вільних кластерах
+        matched_per_row: list[list[dict]] = [[] for _ in rep_events]
+
+        for i, rep_ev in enumerate(rep_events):
+            r_start = rep_ev.get("start_ts")
+            if r_start is None:
+                continue
+            r_sens = str(rep_ev.get("sensor") or "").strip().lower()
+            for n in notifs:
+                n_start = n.get("start_ts")
+                n_sens = str(n.get("sensor_name") or "").strip().lower()
+                sens_ok = not r_sens or not n_sens or r_sens == n_sens
+                if sens_ok and n_start is not None and abs(n_start - r_start) <= 90.0:
+                    matched_per_row[i].append(n)
+                    used_notif_ids.add(n["id"])
+
+        for i, rep_ev in enumerate(rep_events):
+            if rep_ev.get("start_ts") is not None:
+                continue
+            unused = [n for n in notifs if n["id"] not in used_notif_ids]
+            clusters = _cluster_events(unused) if unused else []
+            if clusters:
+                r_sens = str(rep_ev.get("sensor") or "").strip().lower()
+                r_vol = rep_ev.get("volume")
+                cand_cls = [
+                    cl for cl in clusters
+                    if not r_sens or not cl[0].get("sensor_name") or cl[0].get("sensor_name", "").strip().lower() == r_sens
+                ] or clusters
+                if r_vol is not None:
+                    cand_cls.sort(key=lambda cl: abs((cl[0].get("volume") or r_vol) - r_vol))
+                chosen = cand_cls[0]
+                matched_per_row[i] = chosen
+                for n in chosen:
+                    used_notif_ids.add(n["id"])
+
+        for idx, (rep_ev, matched) in enumerate(zip(rep_events, matched_per_row), 1):
             r_start = rep_ev.get("start_ts")
             r_fin = rep_ev.get("finish_ts")
             r_vol = rep_ev.get("volume")
-            r_sens = str(rep_ev.get("sensor") or "").strip().lower()
-            matched: list[dict] = []
-
-            if r_start is not None:
-                for n in notifs:
-                    n_start = n.get("start_ts")
-                    n_sens = str(n.get("sensor_name") or "").strip().lower()
-                    sens_ok = not r_sens or not n_sens or r_sens == n_sens
-                    if sens_ok and n_start is not None and abs(n_start - r_start) <= 90.0:
-                        matched.append(n)
-                        used_notif_ids.add(n["id"])
-            else:
-                # Якщо звіт не повернув start_ts у рядку — прив'язуємо по кластерах за порядком
-                clusters = _cluster_events(notifs)
-                if idx - 1 < len(clusters):
-                    matched = clusters[idx - 1]
-                    for n in matched:
-                        used_notif_ids.add(n["id"])
-
             rep_vol_str = f"{sign}{r_vol:.1f} л" if r_vol is not None else "—"
             rep_t_str = _fmt_ts_kyiv(r_start)
             stag = _sensor_tag(rep_ev, matched[0] if matched else None)
