@@ -1097,14 +1097,15 @@ def audit_notifications_vs_report(
     drains_found: list[dict],
 ) -> dict:
     """
-    Виконує звірку 1-в-1 сповіщень з подіями звіту (по fuelStartTime і типу).
-    Повертає класифікацію: OK / ПРОПУСК / ДУБЛЬ / ДУБЛЬ ЗІ ЗСУВОМ.
+    Виконує звірку 1-в-1 сповіщень з подіями звіту (по fuelStartTime, датчику й об'єму).
+    Повертає класифікацію: OK / ПРОПУСК / ДУБЛЬ / ДУБЛЬ ЗІ ЗСУВОМ / РОЗБІЖНІСТЬ ОБ'ЄМУ.
     """
     exp_r = cfg.get("expected_refills", 2)
     exp_d = cfg.get("expected_drains", 1)
     lines: list[str] = []
     has_missing = False
     has_duplicates = False
+    has_volume_mismatch = False
 
     if not report.get("checked"):
         # Fallback: кластерний аналіз, якщо звіт тимчасово недоступний
@@ -1128,6 +1129,7 @@ def audit_notifications_vs_report(
             "ok": not has_missing and not has_duplicates,
             "has_missing": has_missing,
             "has_duplicates": has_duplicates,
+            "has_volume_mismatch": False,
             "summary": "\n".join(lines) + f"\n\nℹ️ Звіт не перевірено: {report.get('reason')}",
         }
 
@@ -1154,7 +1156,7 @@ def audit_notifications_vs_report(
         return f" [{s}]" if s else ""
 
     def match_group(label: str, rep_events: list[dict], notifs: list[dict], sign: str, exp_cnt: int) -> None:
-        nonlocal has_missing, has_duplicates
+        nonlocal has_missing, has_duplicates, has_volume_mismatch
         used_notif_ids: set = set()
 
         if not rep_events and notifs:
@@ -1229,18 +1231,34 @@ def audit_notifications_vs_report(
                 n_vol = n.get("volume")
                 n_vol_str = f"{sign}{n_vol:.1f} л" if n_vol is not None else "—"
                 delay_str = _fmt_delay(r_fin or n.get("finish_ts"), n.get("created_ts"))
-                lines.append(
-                    f"✅ {label} #{idx}{stag}: OK | звіт: {rep_vol_str} ({rep_t_str}) | "
-                    f"алерт: {n_vol_str} ({_fmt_ts_kyiv(n.get('start_ts'))}), затримка: {delay_str}"
-                )
+                vol_diff = abs(r_vol - n_vol) if (r_vol is not None and n_vol is not None) else None
+                is_vol_mismatch = vol_diff is not None and vol_diff > max(10.0, 0.20 * abs(r_vol))
+                if is_vol_mismatch:
+                    has_volume_mismatch = True
+                    pct = (vol_diff / abs(r_vol) * 100.0) if r_vol else 100.0
+                    lines.append(
+                        f"⚠️ {label} #{idx}{stag}: РОЗБІЖНІСТЬ ОБ'ЄМУ ({pct:.0f}%) | звіт: {rep_vol_str} ({rep_t_str}) | "
+                        f"алерт: {n_vol_str} ({_fmt_ts_kyiv(n.get('start_ts'))}), затримка: {delay_str}"
+                    )
+                else:
+                    lines.append(
+                        f"✅ {label} #{idx}{stag}: OK | звіт: {rep_vol_str} ({rep_t_str}) | "
+                        f"алерт: {n_vol_str} ({_fmt_ts_kyiv(n.get('start_ts'))}), затримка: {delay_str}"
+                    )
             else:
                 has_duplicates = True
                 n0 = matched[0]
                 n0_vol = n0.get("volume")
                 n0_vol_str = f"{sign}{n0_vol:.1f} л" if n0_vol is not None else "—"
                 delay_str = _fmt_delay(r_fin or n0.get("finish_ts"), n0.get("created_ts"))
+                vol_diff = abs(r_vol - n0_vol) if (r_vol is not None and n0_vol is not None) else None
+                vol_tag = ""
+                if vol_diff is not None and vol_diff > max(10.0, 0.20 * abs(r_vol)):
+                    has_volume_mismatch = True
+                    pct = (vol_diff / abs(r_vol) * 100.0) if r_vol else 100.0
+                    vol_tag = f" + РОЗБІЖНІСТЬ ОБ'ЄМУ ({pct:.0f}%)"
                 lines.append(
-                    f"⚠️ {label} #{idx}{stag}: ДУБЛЬ (x{len(matched)}) | звіт: {rep_vol_str} ({rep_t_str}) | "
+                    f"⚠️ {label} #{idx}{stag}: ДУБЛЬ (x{len(matched)}){vol_tag} | звіт: {rep_vol_str} ({rep_t_str}) | "
                     f"алерт: {n0_vol_str} ({_fmt_ts_kyiv(n0.get('start_ts'))}), затримка: {delay_str}"
                 )
 
@@ -1279,9 +1297,10 @@ def audit_notifications_vs_report(
 
     count_ok = (len(rep_refills) >= exp_r and len(rep_drains) >= exp_d) if report_driven else (len(rep_refills) == exp_r and len(rep_drains) == exp_d)
     return {
-        "ok": (not has_missing) and (not has_duplicates) and count_ok,
+        "ok": (not has_missing) and (not has_duplicates) and (not has_volume_mismatch) and count_ok,
         "has_missing": has_missing,
         "has_duplicates": has_duplicates,
+        "has_volume_mismatch": has_volume_mismatch,
         "summary": "\n".join(lines),
     }
 
@@ -1417,11 +1436,17 @@ def run_canary(cfg: dict, send_fn: Callable[[dict], float]) -> int:
         save_state(cfg, state)
         return 0
 
-    if audit["has_duplicates"] and not audit["has_missing"]:
-        log.warning("Усі події є, але виявлено ДУБЛІ!\n%s", summary)
+    if not audit["has_missing"] and (audit["has_duplicates"] or audit.get("has_volume_mismatch")):
+        if audit["has_duplicates"] and audit.get("has_volume_mismatch"):
+            warn_title = "Виявлено ДУБЛІ та розбіжність об'єму!"
+        elif audit["has_duplicates"]:
+            warn_title = "Виявлено ДУБЛІ сповіщень!"
+        else:
+            warn_title = "Виявлено розбіжність об'єму (>20% vs звіт)!"
+        log.warning("%s\n%s", warn_title, summary)
         _send_both_tg(
             cfg,
-            f"⚠️ {label}: Виявлено ДУБЛІ сповіщень!\nОб'єкт: {cfg['device_name']}\n\n{summary}",
+            f"⚠️ {label}: {warn_title}\nОб'єкт: {cfg['device_name']}\n\n{summary}",
         )
         state["incident_open"] = True
         save_state(cfg, state)
