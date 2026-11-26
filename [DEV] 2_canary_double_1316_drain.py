@@ -12,8 +12,8 @@
      - Заправка B одразу через 2 с після A (4.5 хв, щільні 15 с точки, +290 л: 238 -> 528 л);
      - плато стабілізації 5 хв (20 точок > 17).
   3. Коротка поїздка 2 по Черкасах (2.25 хв, 1.22 км -> закриває стоянку 1).
-  4. Стоянка 2 (13.75 хв): полиця 5 хв (20 точок) + Злив 3.75 хв (-265 л: 526 -> 261 л) + плато 5 хв (20 точок).
-  5. Поїздка 3 (2.75 хв, 1.39 км) + фінішна стоянка (2 хв).
+  4. Стоянка 2 (15.25 хв): полиця 5 хв (20 точок) + Злив 5.25 хв (-396 л: 526 -> 130 л) + плато 5 хв (20 точок).
+  5. Поїздка 3 (2.75 хв, 1.39 км, 130 -> 128 л) + фінішна стоянка (2 хв, 128 л = старту для 0 л стику).
 
 Перевірка: звірка 1-в-1 зі Звітом v2 №1180 по metadata.fuelStartTime.
 """
@@ -127,15 +127,15 @@ def send_canary_events(cfg: dict) -> float:
     ]
     pacer.send_trip(trip2_points, start_level=528, end_level=526)
 
-    # 4. Стоянка 2 + Злив (5 хв полиця + 3.75 хв злив -265 л + 5 хв плато під N=35)
-    log.info(">>> ЕТАП 4: Стоянка під злив — полиця (5 хв) + Злив (3.75 хв, 526 -> 261 л, -265 л) + плато (5 хв)...")
+    # 4. Стоянка 2 + Злив (5 хв полиця + 5.25 хв злив -396 л + 5 хв плато під N=35)
+    log.info(">>> ЕТАП 4: Стоянка під злив — полиця (5 хв) + Злив (5.25 хв, 526 -> 130 л, -396 л) + плато (5 хв)...")
     pacer.send_plateau(level=526, lat=lat_drain, lon=lon_drain, count=20)
-    drain_curve = [519, 505, 487, 466, 443, 419, 395, 371, 348, 326, 306, 289, 276, 267, 261]
+    drain_curve = [520, 511, 498, 482, 462, 439, 414, 387, 359, 330, 301, 273, 246, 221, 198, 178, 161, 147, 138, 132, 130]
     pacer.send_curve(drain_curve, lat=lat_drain, lon=lon_drain)
-    pacer.send_plateau(level=261, lat=lat_drain, lon=lon_drain, count=20)
+    pacer.send_plateau(level=130, lat=lat_drain, lon=lon_drain, count=20)
 
-    # 5. Поїздка 3 + фінішна стоянка
-    log.info(">>> ЕТАП 5: Поїздка 3 (1.39 км) та фінішна стоянка (закриває злив у ядрі M2M)...")
+    # 5. Поїздка 3 + фінішна стоянка (фініш 128 л = старту)
+    log.info(">>> ЕТАП 5: Поїздка 3 (1.39 км, 130 -> 128 л) та фінішна стоянка (закриває злив у ядрі M2M)...")
     trip3_points = [
         (49.4488996, 32.0609452, 24),
         (49.4484998, 32.0586090, 42),
@@ -149,10 +149,10 @@ def send_canary_events(cfg: dict) -> float:
         (lat_park_end, lon_park_end, 15),
         (lat_park_end, lon_park_end, 0),
     ]
-    pacer.send_trip(trip3_points, start_level=261, end_level=259)
-    pacer.send_plateau(level=259, lat=lat_park_end, lon=lon_park_end, count=8)
+    pacer.send_trip(trip3_points, start_level=130, end_level=128)
+    pacer.send_plateau(level=128, lat=lat_park_end, lon=lon_park_end, count=8)
 
-    log.info("Усі 167 точок [Short Double 1316: 2 Back-to-Back Refills + Drain] відправлено успішно!")
+    log.info("Усі 173 точки [Short Double 1316: 2 Back-to-Back Refills + Drain] відправлено успішно!")
     return time.time()
 
 
