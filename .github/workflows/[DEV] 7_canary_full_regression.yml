@@ -1,6 +1,10 @@
 name: '[DEV] 7_canary_full_regression [5h30]'
 
 on:
+  schedule:
+    # Автозапуск 3 рази на добу кожні 8 год (~5 год 34 хв прогін + ~2 год 26 хв пауза):
+    # 06:15, 14:15, 22:15 UTC (= 08:15, 16:15, 00:15 Київ взимку)
+    - cron: '15 6,14,22 * * *'
   workflow_dispatch:
 
 permissions:
