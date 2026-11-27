@@ -87,29 +87,26 @@ def calculate_bearing(lat1: float, lon1: float, lat2: float, lon2: float) -> int
     return int(round((deg + 360.0) % 360.0)) % 360
 
 
-def send_teltonika_point(
-    cfg: dict,
+def _build_codec8_record(
+    ts_ms: int,
     level: float,
     lat: float,
     lon: float,
-    speed: int = 0,
-    bearing: int | None = None,
-    ignition: int = 1,
+    speed: int,
+    bearing: int,
+    ignition: int,
+    cfg: dict,
     extra_2byte_ios: dict[int, float] | None = None,
-) -> None:
-    """Надсилає одну точку Teltonika Codec 8 через TCP з автоповторами (підтримує кілька 2-байтових IO)."""
-    host, port, imei = cfg["ingest_host"], cfg["ingest_port"], cfg["tracker_imei"]
-    timestamp_ms = int(time.time() * 1000)
-    used_bearing = cfg.get("bearing", 0) if bearing is None else int(bearing) % 360
-
+) -> bytes:
+    """Формує один AVL-запис протоколу Teltonika Codec 8."""
     avl_data = struct.pack(
         ">Q b i i h h B h",
-        timestamp_ms,
+        int(ts_ms),
         0,
         int(round(lon * 10_000_000)),
         int(round(lat * 10_000_000)),
         cfg["altitude"],
-        used_bearing,
+        int(bearing) % 360,
         cfg["sat"],
         int(round(speed)),
     )
@@ -141,33 +138,30 @@ def send_teltonika_point(
     # 4-byte and 8-byte elements: 0
     io_data.append(0)
     io_data.append(0)
+    return avl_data + bytes(io_data)
 
-    data_part8 = bytearray([0x08, 1]) + avl_data + io_data + bytearray([1])
+
+def _build_codec8_packet(avl_records: list[bytes]) -> bytes:
+    """Пакує від 1 до 255 AVL-записів у TCP-кадр Teltonika Codec 8 з CRC-16."""
+    count = len(avl_records)
+    if not (1 <= count <= 255):
+        raise ValueError(f"Codec 8 підтримує 1..255 записів у пакеті, передано {count}")
+    data_part8 = bytearray([0x08, count])
+    for rec in avl_records:
+        data_part8.extend(rec)
+    data_part8.append(count)
     crc8 = crc16_arc(data_part8)
-    packet_c8 = (
+    return (
         bytearray(b"\x00\x00\x00\x00")
         + struct.pack(">I", len(data_part8))
-        + data_part8
+        + bytes(data_part8)
         + struct.pack(">I", crc8)
     )
 
-    extra_str = ""
-    if len(io_2byte) > 1:
-        extra_str = ", " + ", ".join(
-            ("AdBlue=%d л" % v if k == 203 else f"io_{k}=%d" % v) for k, v in io_2byte[1:]
-        )
 
-    log.info(
-        "Teltonika: Fuel=%d л%s, Speed=%d км/год, Course=%d°, Ignition=%d (lat=%.6f, lon=%.6f)",
-        int(round(level)),
-        extra_str,
-        int(round(speed)),
-        used_bearing,
-        1 if ignition else 0,
-        lat,
-        lon,
-    )
-
+def _send_codec8_packet(cfg: dict, packet_c8: bytes) -> None:
+    """Відправляє готовий Codec 8 TCP-кадр із автоповторами при тимчасовому обриві з'єднання."""
+    host, port, imei = cfg["ingest_host"], cfg["ingest_port"], cfg["tracker_imei"]
     max_retries = 5
     for attempt in range(1, max_retries + 1):
         try:
@@ -196,8 +190,86 @@ def send_teltonika_point(
             time.sleep(delay)
 
 
+def _format_extra_ios_log(extra_2byte_ios: dict[int, float] | None) -> str:
+    if not extra_2byte_ios:
+        return ""
+    parts = []
+    for k in sorted(extra_2byte_ios):
+        v = extra_2byte_ios[k]
+        if v is not None and int(k) != 201:
+            parts.append("AdBlue=%d л" % round(v) if int(k) == 203 else f"io_{int(k)}=%d" % round(v))
+    return (", " + ", ".join(parts)) if parts else ""
+
+
+def send_teltonika_point(
+    cfg: dict,
+    level: float,
+    lat: float,
+    lon: float,
+    speed: int = 0,
+    bearing: int | None = None,
+    ignition: int = 1,
+    extra_2byte_ios: dict[int, float] | None = None,
+    ts_sec: float | None = None,
+) -> None:
+    """Надсилає одну точку Teltonika Codec 8 через TCP з автоповторами (підтримує кілька 2-байтових IO)."""
+    used_ts_ms = int((time.time() if ts_sec is None else ts_sec) * 1000)
+    used_bearing = cfg.get("bearing", 0) if bearing is None else int(bearing) % 360
+    rec = _build_codec8_record(
+        used_ts_ms, level, lat, lon, speed, used_bearing, ignition, cfg, extra_2byte_ios
+    )
+    packet_c8 = _build_codec8_packet([rec])
+
+    log.info(
+        "Teltonika: Fuel=%d л%s, Speed=%d км/год, Course=%d°, Ignition=%d (lat=%.6f, lon=%.6f)",
+        int(round(level)),
+        _format_extra_ios_log(extra_2byte_ios),
+        int(round(speed)),
+        used_bearing,
+        1 if ignition else 0,
+        lat,
+        lon,
+    )
+    _send_codec8_packet(cfg, packet_c8)
+
+
+def send_teltonika_batch(cfg: dict, records: list[dict], batch_size: int = 20) -> None:
+    """Вивантажує список ретро-записів blackbox багатозаписними TCP-пакетами Codec 8."""
+    if not records:
+        return
+    default_bearing = cfg.get("bearing", 0)
+    for idx in range(0, len(records), batch_size):
+        chunk = records[idx : idx + batch_size]
+        avl_bytes = [
+            _build_codec8_record(
+                int(r["ts_sec"] * 1000),
+                r["level"],
+                r["lat"],
+                r["lon"],
+                r.get("speed", 0),
+                default_bearing if r.get("bearing") is None else r["bearing"],
+                r.get("ignition", 1),
+                cfg,
+                r.get("extra_ios"),
+            )
+            for r in chunk
+        ]
+        packet_c8 = _build_codec8_packet(avl_bytes)
+        t_first = _fmt_ts_kyiv(chunk[0]["ts_sec"])
+        t_last = _fmt_ts_kyiv(chunk[-1]["ts_sec"])
+        log.info(
+            "Teltonika Blackbox batch (%d/%d): %d точок (%s .. %s)",
+            idx // batch_size + 1,
+            (len(records) + batch_size - 1) // batch_size,
+            len(chunk),
+            t_first,
+            t_last,
+        )
+        _send_codec8_packet(cfg, packet_c8)
+
+
 class TrackPacer:
-    """Керує інтервалами відправки точок (щільні по 15 с, сон CAN по 10 хв, довільні гепи) без дрейфу."""
+    """Керує інтервалами відправки точок (щільні по 15 с, сон CAN по 10 хв, blackbox, гепи) без дрейфу."""
 
     def __init__(self, cfg: dict, step_sec: float = 15.0, initial_bearing: int = 90) -> None:
         self.cfg = cfg
@@ -206,10 +278,49 @@ class TrackPacer:
         self.last_lat: float | None = None
         self.last_lon: float | None = None
         self.last_bearing: int = initial_bearing
+        self._bb_active: bool = False
+        self._bb_next_ts: float = 0.0
+        self._bb_buffer: list[dict] = []
+
+    def begin_blackbox(self, start_delay_sec: float | None = None) -> None:
+        """Переводить TrackPacer у режим буферизації blackbox без негайного очікування й відправки."""
+        delay = self.step_sec if start_delay_sec is None else start_delay_sec
+        self._bb_active = True
+        self._bb_next_ts = time.time() + delay
+        self._bb_buffer = []
+
+    def flush_blackbox(self, wait_until_end: bool = True, batch_size: int = 20) -> None:
+        """Дочекається настання кінцевого часу чорного ящика і вивантажить буфер пакетами Codec 8."""
+        if not self._bb_active:
+            return
+        buf = list(self._bb_buffer)
+        self._bb_active = False
+        self._bb_buffer = []
+        if not buf:
+            self.next_deadline = time.monotonic() + self.step_sec
+            return
+
+        last_ts = buf[-1]["ts_sec"]
+        if wait_until_end:
+            wait_s = (last_ts + 2.0) - time.time()
+            if wait_s > 0:
+                log.info(
+                    "Офлайн-буфер (blackbox): накопичено %d точок (%s .. %s). Імітація втрати зв'язку %.1f хв...",
+                    len(buf),
+                    _fmt_ts_kyiv(buf[0]["ts_sec"]),
+                    _fmt_ts_kyiv(last_ts),
+                    wait_s / 60.0,
+                )
+                time.sleep(wait_s)
+
+        send_teltonika_batch(self.cfg, buf, batch_size=batch_size)
+        self.next_deadline = time.monotonic() + self.step_sec
 
     def advance(self, gap_sec: float) -> None:
         """Додає довільний розрив у часі без відправки точок (наприклад, розрив зв'язку або рідка точка)."""
-        if self.next_deadline is None:
+        if self._bb_active:
+            self._bb_next_ts += gap_sec - self.step_sec
+        elif self.next_deadline is None:
             self.next_deadline = time.monotonic() + gap_sec
         else:
             # Віднімаємо один базовий крок, якщо наступний emit сам додає step_sec
@@ -224,16 +335,34 @@ class TrackPacer:
         step_override: float | None = None,
         extra_ios: dict[int, float] | None = None,
     ) -> None:
+        if self.last_lat is not None and self.last_lon is not None and speed > 0:
+            computed = calculate_bearing(self.last_lat, self.last_lon, lat, lon)
+            if computed >= 0:
+                self.last_bearing = computed
+
+        dt = self.step_sec if step_override is None else step_override
+        if self._bb_active:
+            self._bb_buffer.append(
+                {
+                    "ts_sec": self._bb_next_ts,
+                    "level": level,
+                    "lat": lat,
+                    "lon": lon,
+                    "speed": speed,
+                    "bearing": self.last_bearing,
+                    "ignition": 1,
+                    "extra_ios": dict(extra_ios) if extra_ios else None,
+                }
+            )
+            self.last_lat, self.last_lon = lat, lon
+            self._bb_next_ts += dt
+            return
+
         now = time.monotonic()
         if self.next_deadline is None:
             self.next_deadline = now
         elif now < self.next_deadline:
             time.sleep(self.next_deadline - now)
-
-        if self.last_lat is not None and self.last_lon is not None and speed > 0:
-            computed = calculate_bearing(self.last_lat, self.last_lon, lat, lon)
-            if computed >= 0:
-                self.last_bearing = computed
 
         send_teltonika_point(
             self.cfg,
@@ -245,7 +374,6 @@ class TrackPacer:
             extra_2byte_ios=extra_ios,
         )
         self.last_lat, self.last_lon = lat, lon
-        dt = self.step_sec if step_override is None else step_override
         self.next_deadline = max(time.monotonic(), self.next_deadline + dt)
 
     def send_plateau(
@@ -280,11 +408,11 @@ class TrackPacer:
     ) -> None:
         """Відправляє рідкі точки [(gap_before_sec, level), ...], кожна з власним інтервалом."""
         for idx, (gap_s, lvl) in enumerate(steps):
-            if idx > 0 and gap_s != self.step_sec:
-                # Коригуємо deadline відносно попередньої точки
-                self.next_deadline = (self.next_deadline or time.monotonic()) + (gap_s - self.step_sec)
-            elif idx == 0 and gap_s > 0:
-                self.next_deadline = (self.next_deadline or time.monotonic()) + (gap_s - self.step_sec)
+            if idx == 0 or gap_s != self.step_sec:
+                if self._bb_active:
+                    self._bb_next_ts += gap_s - self.step_sec
+                elif gap_s > 0 or idx > 0:
+                    self.next_deadline = (self.next_deadline or time.monotonic()) + (gap_s - self.step_sec)
             self.emit(level=lvl, lat=lat, lon=lon, speed=0, extra_ios=extra_ios)
 
     def send_trip(
@@ -647,6 +775,7 @@ def collect_history_events(
         "refill_drain_unit_double",
         "refill_drain_unit_triple",
         "refill_drain_unit_quatro",
+        "refill_drain_unit_full",
     } - {target_name.lower()}
 
     for item in items:
@@ -697,24 +826,30 @@ def collect_history_events(
                 continue
         if scenario_mode == "single" and (
             "double" in template_name or "сценарій 2" in template_name
-            or "triple" in template_name or "quatro" in template_name
+            or "triple" in template_name or "quatro" in template_name or "full" in template_name
         ):
             continue
         elif scenario_mode == "double" and (
             "single" in template_name or "сценарій 1" in template_name
-            or "triple" in template_name or "quatro" in template_name
+            or "triple" in template_name or "quatro" in template_name or "full" in template_name
         ):
             continue
         elif scenario_mode == "triple" and (
             "single" in template_name or "сценарій 1" in template_name
             or "double" in template_name or "сценарій 2" in template_name
-            or "quatro" in template_name
+            or "quatro" in template_name or "full" in template_name
         ):
             continue
         elif scenario_mode == "quatro" and (
             "single" in template_name or "сценарій 1" in template_name
             or "double" in template_name or "сценарій 2" in template_name
-            or "triple" in template_name
+            or "triple" in template_name or "full" in template_name
+        ):
+            continue
+        elif scenario_mode == "full" and (
+            "single" in template_name or "сценарій 1" in template_name
+            or "double" in template_name or "сценарій 2" in template_name
+            or "triple" in template_name or "quatro" in template_name
         ):
             continue
 
@@ -729,13 +864,15 @@ def collect_history_events(
         elif not matched and (
             (target_refill and target_refill in template_name) or (target_drain and target_drain in template_name)
         ):
-            if scenario_mode == "single" and not any(w in template_name for w in ("double", "triple", "quatro")):
+            if scenario_mode == "single" and not any(w in template_name for w in ("double", "triple", "quatro", "full")):
                 matched = True
-            elif scenario_mode == "double" and not any(w in template_name for w in ("single", "triple", "quatro")):
+            elif scenario_mode == "double" and not any(w in template_name for w in ("single", "triple", "quatro", "full")):
                 matched = True
             elif scenario_mode == "triple" and "triple" in template_name:
                 matched = True
             elif scenario_mode == "quatro" and "quatro" in template_name:
+                matched = True
+            elif scenario_mode == "full" and "full" in template_name:
                 matched = True
 
         if not matched:
