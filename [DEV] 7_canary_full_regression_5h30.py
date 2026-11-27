@@ -45,11 +45,11 @@ CONFIG = {
     "expected_refills": 4,
     "expected_drains": 4,
 
-    # Чекаємо завершення останньої сесії після вивантаження blackbox + 1 хв фінального онлайну (~16 хв)
+    # Чекаємо завершення останньої сесії після вивантаження blackbox + 1 хв фінального онлайну (~19 хв запасу під 15-хв таймаут)
     "wait_full_window": True,
     "initial_wait_sec": 660,
     "poll_interval_sec": 30,
-    "max_wait_sec": 300,
+    "max_wait_sec": 480,
     "http_timeout_sec": 60,
 
     "altitude": 178,

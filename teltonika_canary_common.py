@@ -9,6 +9,7 @@
   - діагностику і Telegram-сповіщення.
 """
 
+import importlib.util
 import json
 import logging
 import math
@@ -25,6 +26,17 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 log = logging.getLogger("teltonika_canary_common")
+
+
+def load_scenario_sender(script_filename: str) -> Callable[[dict], float]:
+    """Завантажує функцію `send_canary_events` із сусіднього скрипту без дублювання коду сценарію."""
+    path = Path(__file__).resolve().parent / script_filename
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Не вдалося завантажити сценарій із {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.send_canary_events
 
 try:
     from zoneinfo import ZoneInfo

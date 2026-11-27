@@ -1,0 +1,49 @@
+name: '[PROD] 7_canary_full_regression [5h30]'
+
+on:
+  schedule:
+    # Автозапуск 3 рази на добу кожні 8 год (~5 год 34 хв прогін + ~2 год 26 хв пауза):
+    # 00:45, 08:45, 16:45 UTC (= 02:45, 10:45, 18:45 Київ взимку)
+    - cron: '45 0,8,16 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: prod-canary-7-full-regression
+  cancel-in-progress: false
+
+jobs:
+  run-prod-7-canary-full-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    env:
+      TZ: Europe/Kyiv
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run [PROD] 7_canary_full_regression_5h30.py
+        env:
+          M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
+          M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}
+          M2M_API_TOKEN: ${{ secrets.M2M_API_TOKEN }}
+          M2M_API_BASE_URL: https://my.m2m.eu/api
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_DM_CHAT_ID: ${{ secrets.TELEGRAM_DM_CHAT_ID }}
+        run: python "[PROD] 7_canary_full_regression_5h30.py"
