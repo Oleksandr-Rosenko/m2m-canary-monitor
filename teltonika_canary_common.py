@@ -153,6 +153,19 @@ def _build_codec8_record(
     return avl_data + bytes(io_data)
 
 
+def _build_codec12_command_packet(result_text: str) -> bytes:
+    """Формує TCP-кадр Teltonika Codec 12 (відповідь команди) з CRC-16."""
+    res_bytes = result_text.encode("utf-8")
+    data_part12 = bytearray([0x0C, 1, 0x06]) + struct.pack(">I", len(res_bytes)) + res_bytes + bytearray([1])
+    crc12 = crc16_arc(data_part12)
+    return (
+        bytearray(b"\x00\x00\x00\x00")
+        + struct.pack(">I", len(data_part12))
+        + bytes(data_part12)
+        + struct.pack(">I", crc12)
+    )
+
+
 def _build_codec8_packet(avl_records: list[bytes]) -> bytes:
     """Пакує від 1 до 255 AVL-записів у TCP-кадр Teltonika Codec 8 з CRC-16."""
     count = len(avl_records)
@@ -171,8 +184,12 @@ def _build_codec8_packet(avl_records: list[bytes]) -> bytes:
     )
 
 
-def _send_codec8_packet(cfg: dict, packet_c8: bytes) -> None:
-    """Відправляє готовий Codec 8 TCP-кадр із автоповторами при тимчасовому обриві з'єднання."""
+def _send_codec8_packet(
+    cfg: dict,
+    packet_c8: bytes,
+    extra_packets: list[bytes] | None = None,
+) -> None:
+    """Відправляє готовий Codec 8 TCP-кадр (та опційно Codec 12) із автоповторами при обриві з'єднання."""
     host, port, imei = cfg["ingest_host"], cfg["ingest_port"], cfg["tracker_imei"]
     max_retries = 5
     for attempt in range(1, max_retries + 1):
@@ -186,6 +203,16 @@ def _send_codec8_packet(cfg: dict, packet_c8: bytes) -> None:
                     return
                 sock.sendall(packet_c8)
                 sock.recv(4)
+                if extra_packets:
+                    for extra_pkt in extra_packets:
+                        sock.sendall(extra_pkt)
+                        try:
+                            sock.settimeout(3.0)
+                            sock.recv(4)
+                        except (socket.timeout, TimeoutError):
+                            pass
+                        finally:
+                            sock.settimeout(cfg["http_timeout_sec"])
             return
         except (socket.error, OSError) as exc:
             if attempt == max_retries:
@@ -223,33 +250,37 @@ def send_teltonika_point(
     ignition: int = 1,
     extra_2byte_ios: dict[int, float] | None = None,
     ts_sec: float | None = None,
+    command_result: str | None = None,
 ) -> None:
-    """Надсилає одну точку Teltonika Codec 8 через TCP з автоповторами (підтримує кілька 2-байтових IO)."""
+    """Надсилає одну точку Teltonika Codec 8 (та опційно Codec 12) через TCP з автоповторами."""
     used_ts_ms = int((time.time() if ts_sec is None else ts_sec) * 1000)
     used_bearing = cfg.get("bearing", 0) if bearing is None else int(bearing) % 360
     rec = _build_codec8_record(
         used_ts_ms, level, lat, lon, speed, used_bearing, ignition, cfg, extra_2byte_ios
     )
     packet_c8 = _build_codec8_packet([rec])
+    extra_pkts = [_build_codec12_command_packet(command_result)] if command_result else None
 
     log.info(
-        "Teltonika: Fuel=%d л%s, Speed=%d км/год, Course=%d°, Ignition=%d (lat=%.6f, lon=%.6f)",
+        "Teltonika: Fuel=%d л%s, Speed=%d км/год, Course=%d°, Ignition=%d%s (lat=%.6f, lon=%.6f)",
         int(round(level)),
         _format_extra_ios_log(extra_2byte_ios),
         int(round(speed)),
         used_bearing,
         1 if ignition else 0,
+        f", Cmd={command_result}" if command_result else "",
         lat,
         lon,
     )
-    _send_codec8_packet(cfg, packet_c8)
+    _send_codec8_packet(cfg, packet_c8, extra_packets=extra_pkts)
 
 
-def send_teltonika_batch(cfg: dict, records: list[dict], batch_size: int = 20) -> None:
-    """Вивантажує список ретро-записів blackbox багатозаписними TCP-пакетами Codec 8."""
+def send_teltonika_batch(cfg: dict, records: list[dict], batch_size: int = 20) -> int:
+    """Вивантажує список ретро-записів blackbox багатозаписними TCP-пакетами Codec 8; повертає кількість пакетів."""
     if not records:
-        return
+        return 0
     default_bearing = cfg.get("bearing", 0)
+    total_batches = (len(records) + batch_size - 1) // batch_size
     for idx in range(0, len(records), batch_size):
         chunk = records[idx : idx + batch_size]
         avl_bytes = [
@@ -272,12 +303,13 @@ def send_teltonika_batch(cfg: dict, records: list[dict], batch_size: int = 20) -
         log.info(
             "Teltonika Blackbox batch (%d/%d): %d точок (%s .. %s)",
             idx // batch_size + 1,
-            (len(records) + batch_size - 1) // batch_size,
+            total_batches,
             len(chunk),
             t_first,
             t_last,
         )
         _send_codec8_packet(cfg, packet_c8)
+    return total_batches
 
 
 class TrackPacer:
@@ -293,6 +325,9 @@ class TrackPacer:
         self._bb_active: bool = False
         self._bb_next_ts: float = 0.0
         self._bb_buffer: list[dict] = []
+        self.online_points: int = 0
+        self.blackbox_points: int = 0
+        self.blackbox_batches: int = 0
 
     def begin_blackbox(self, start_delay_sec: float | None = None) -> None:
         """Переводить TrackPacer у режим буферизації blackbox без негайного очікування й відправки."""
@@ -325,7 +360,9 @@ class TrackPacer:
                 )
                 time.sleep(wait_s)
 
-        send_teltonika_batch(self.cfg, buf, batch_size=batch_size)
+        sent_batches = send_teltonika_batch(self.cfg, buf, batch_size=batch_size)
+        self.blackbox_points += len(buf)
+        self.blackbox_batches += sent_batches
         self.next_deadline = time.monotonic() + self.step_sec
 
     def advance(self, gap_sec: float) -> None:
@@ -346,6 +383,7 @@ class TrackPacer:
         speed: int = 0,
         step_override: float | None = None,
         extra_ios: dict[int, float] | None = None,
+        command_result: str | None = None,
     ) -> None:
         if self.last_lat is not None and self.last_lon is not None and speed > 0:
             computed = calculate_bearing(self.last_lat, self.last_lon, lat, lon)
@@ -384,7 +422,9 @@ class TrackPacer:
             speed=speed,
             bearing=self.last_bearing,
             extra_2byte_ios=extra_ios,
+            command_result=command_result,
         )
+        self.online_points += 1
         self.last_lat, self.last_lon = lat, lon
         self.next_deadline = max(time.monotonic(), self.next_deadline + dt)
 
@@ -1606,6 +1646,441 @@ def run_canary(cfg: dict, send_fn: Callable[[dict], float]) -> int:
         cfg,
         f"🔴 {label}: Пропуски або збій сповіщень!\nОб'єкт: {cfg['device_name']}\n\n{summary}",
     )
+    state["incident_open"] = True
+    save_state(cfg, state)
+    return 1
+
+
+# --------------------------------------------------------------------------
+# Multievent Canary Audit & Telegram Statistics (Fuel + Geofence + Speed + Sensor + Idle + Cmd)
+# --------------------------------------------------------------------------
+
+MULTIEVENT_LABELS: tuple[tuple[str, str], ...] = (
+    ("GEO_OUT", "Вихід з геозони"),
+    ("GEO_IN", "Вхід у геозону"),
+    ("OVERSPEED", "Перевищення"),
+    ("SENSOR", "Датчик 701-801л"),
+    ("IDLE", "Простій >5хв"),
+    ("COMMAND", "Команда Codec 12"),
+)
+
+
+def _extract_instant_event_ts(item: dict) -> float | None:
+    """Повертає час самої події (без createdAt), щоб порахувати реальну затримку доставки."""
+    meta = _parse_metadata(item)
+    for key in ("eventTime", "finishTime", "endTime", "startTime", "time"):
+        ts = _parse_any_ts(meta.get(key))
+        if ts is not None:
+            return ts
+    for key in ("eventTime", "serverTime", "time"):
+        ts = _parse_any_ts(item.get(key))
+        if ts is not None:
+            return ts
+    return None
+
+
+def _classify_multievent_type(cfg: dict, item: dict, item_lower: str) -> str | None:
+    """Класифікує подію історії M2M в один із 8 підтримуваних типів сповіщень."""
+    raw_type = str(item.get("type", "")).upper()
+    tpl_type = str(item.get("templateType", "")).upper()
+    tpl_name = str(item.get("templateName", "")).lower()
+    msg = str(item.get("message", "")).lower()
+
+    tpl_map = {
+        key: str(cfg.get(f"template_{key.lower()}", "")).strip().lower()
+        for key in ("refill", "drain", "geo_in", "geo_out", "overspeed", "sensor", "idle")
+    }
+    tpl_cmd = str(cfg.get("template_command", "")).strip().lower()
+
+    if raw_type == "COMMAND_RESULT" or tpl_type == "COMMAND_RESULT" or (tpl_cmd and tpl_cmd in tpl_name):
+        return "COMMAND"
+    if raw_type in ("REFILL", "REFIL") or tpl_type in ("REFILL", "REFIL") or (tpl_map["refill"] and tpl_map["refill"] in tpl_name):
+        return "REFILL"
+    if raw_type == "DRAIN" or tpl_type == "DRAIN" or (tpl_map["drain"] and tpl_map["drain"] in tpl_name):
+        return "DRAIN"
+    if tpl_map["geo_in"] and tpl_map["geo_in"] in tpl_name:
+        return "GEO_IN"
+    if tpl_map["geo_out"] and tpl_map["geo_out"] in tpl_name:
+        return "GEO_OUT"
+    if raw_type == "GEOFENCE" or tpl_type == "GEOFENCE":
+        txt = f"{tpl_name} {msg}"
+        if any(w in txt for w in ("вихід", "exit", "outside")):
+            return "GEO_OUT"
+        if any(w in txt for w in ("вхід", "enter", "inside")):
+            return "GEO_IN"
+    if raw_type == "OVERSPEED" or tpl_type == "OVERSPEED" or (tpl_map["overspeed"] and tpl_map["overspeed"] in tpl_name):
+        return "OVERSPEED"
+    if raw_type == "SENSOR_VALUE" or tpl_type == "SENSOR_VALUE" or (tpl_map["sensor"] and tpl_map["sensor"] in tpl_name):
+        return "SENSOR"
+    if raw_type == "IDLE" or tpl_type == "IDLE" or (tpl_map["idle"] and tpl_map["idle"] in tpl_name):
+        return "IDLE"
+
+    for ev_key, tpl_val in (
+        ("COMMAND", tpl_cmd),
+        ("GEO_IN", tpl_map["geo_in"]),
+        ("GEO_OUT", tpl_map["geo_out"]),
+        ("OVERSPEED", tpl_map["overspeed"]),
+        ("SENSOR", tpl_map["sensor"]),
+        ("IDLE", tpl_map["idle"]),
+        ("REFILL", tpl_map["refill"]),
+        ("DRAIN", tpl_map["drain"]),
+    ):
+        if tpl_val and tpl_val in item_lower:
+            return ev_key
+    if "commandsentsuccess" in item_lower:
+        return "COMMAND"
+    return None
+
+
+def collect_multievent_history(
+    cfg: dict,
+    start_ts: float,
+    initial_event_ids: set,
+    max_initial_id: int,
+) -> dict[str, list[dict]]:
+    """Збирає всі 8 типів сповіщень цільового об'єкта з `/notification/history` після start_ts."""
+    items = fetch_history_since(cfg, start_ts)
+    events: dict[str, list[dict]] = {
+        k: [] for k in ("REFILL", "DRAIN", "GEO_OUT", "GEO_IN", "OVERSPEED", "SENSOR", "IDLE", "COMMAND")
+    }
+    seen_ids: set = set()
+
+    target_id = cfg.get("device_id")
+    target_name = str(cfg.get("device_name", "")).strip()
+    target_imei = str(cfg.get("tracker_imei", "")).strip()
+    tpl_candidates = [
+        str(cfg.get(k, "")).strip().lower()
+        for k in (
+            "template_refill",
+            "template_drain",
+            "template_geo_in",
+            "template_geo_out",
+            "template_overspeed",
+            "template_sensor",
+            "template_idle",
+        )
+        if cfg.get(k)
+    ]
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        event_id = item.get("id")
+        if event_id in seen_ids:
+            continue
+        try:
+            num_id = int(event_id)
+            if num_id in initial_event_ids or (max_initial_id > 0 and num_id <= max_initial_id):
+                continue
+        except (ValueError, TypeError):
+            if event_id in initial_event_ids:
+                continue
+
+        created_ts = parse_item_timestamp(item)
+        if created_ts is not None and created_ts < (start_ts - 60):
+            continue
+
+        dev_id = item.get("deviceId")
+        dev_name_l = str(item.get("deviceName") or "").strip().lower()
+        unique_id = str(item.get("uniqueId") or "").strip()
+        tpl_name_l = str(item.get("templateName") or "").lower()
+        msg_l = str(item.get("message") or "").lower()
+
+        if "refill_drain_unit" in dev_name_l or "refill_drain_unit" in msg_l or "refill_drain_unit" in tpl_name_l:
+            continue
+
+        item_str = json.dumps(item, ensure_ascii=False)
+        item_lower = item_str.lower()
+        exact_target = (
+            (target_id and dev_id == target_id)
+            or (target_imei and unique_id == target_imei)
+            or (target_name and dev_name_l == target_name.lower())
+        )
+        if not exact_target:
+            if dev_name_l and target_name and dev_name_l != target_name.lower():
+                continue
+            fallback_match = (
+                (target_imei and target_imei in item_str)
+                or (target_name and target_name.lower() in msg_l)
+                or any(t in tpl_name_l for t in tpl_candidates)
+            )
+            if not fallback_match:
+                continue
+
+        ev_type = _classify_multievent_type(cfg, item, item_lower)
+        if not ev_type:
+            continue
+
+        if ev_type in ("REFILL", "DRAIN"):
+            ev_start_ts = extract_event_start_ts(item)
+            if ev_start_ts is not None and ev_start_ts < (start_ts - 120):
+                continue
+            ev_obj = {
+                "id": event_id,
+                "volume": extract_event_volume(item, item_str),
+                "time": extract_event_time(item),
+                "start_ts": ev_start_ts,
+                "finish_ts": extract_event_finish_ts(item),
+                "created_ts": created_ts,
+                "sensor_id": _parse_metadata(item).get("fuelSensorId"),
+                "sensor_name": _extract_sensor_name(item, _parse_metadata(item)),
+                "duration": extract_event_duration(item),
+            }
+        else:
+            ev_ts = _extract_instant_event_ts(item)
+            delay_sec = None
+            if ev_ts is not None and created_ts is not None:
+                diff = created_ts - ev_ts
+                if -5.0 <= diff <= 7200.0:
+                    delay_sec = max(0, int(round(diff)))
+            ev_obj = {
+                "id": event_id,
+                "event_ts": ev_ts,
+                "created_ts": created_ts,
+                "delay_sec": delay_sec,
+                "time": _fmt_ts_kyiv(ev_ts or created_ts),
+                "message": str(item.get("message") or "").strip(),
+            }
+
+        seen_ids.add(event_id)
+        events[ev_type].append(ev_obj)
+
+    for k in ("REFILL", "DRAIN"):
+        events[k].sort(key=lambda x: (x.get("start_ts") or x.get("created_ts") or 0.0, str(x["id"])))
+    for k, _ in MULTIEVENT_LABELS:
+        events[k].sort(key=lambda x: (x.get("event_ts") or x.get("created_ts") or 0.0, str(x["id"])))
+    return events
+
+
+def _count_instant_duplicates(events: list[dict]) -> int:
+    """Рахує дублі серед миттєвих подій (повтор того самого event_ts <= 5 с або ідентичного тексту <= 2 с)."""
+    if len(events) <= 1:
+        return 0
+    dups = 0
+    prev = events[0]
+    for cur in events[1:]:
+        t1 = prev.get("event_ts")
+        t2 = cur.get("event_ts")
+        c1 = prev.get("created_ts")
+        c2 = cur.get("created_ts")
+        m1 = prev.get("message", "")
+        m2 = cur.get("message", "")
+        same_ev_time = (
+            t1 is not None
+            and t2 is not None
+            and abs(t2 - t1) <= 5.0
+            and (not m1 or not m2 or m1 == m2)
+        )
+        same_created_msg = (
+            c1 is not None and c2 is not None and abs(c2 - c1) <= 2.0 and m1 != "" and m1 == m2
+        )
+        if same_ev_time or same_created_msg:
+            dups += 1
+        else:
+            prev = cur
+    return dups
+
+
+def _summarize_delays(sec_values: list[int]) -> str:
+    if not sec_values:
+        return "—"
+    avg_s = int(round(sum(sec_values) / len(sec_values)))
+    return f"min {_format_duration_sec(min(sec_values))} / avg {_format_duration_sec(avg_s)} / max {_format_duration_sec(max(sec_values))}"
+
+
+def audit_multievent_history(
+    cfg: dict,
+    events_by_type: dict[str, list[dict]],
+    telemetry_stats: dict | None = None,
+) -> dict:
+    """Формує аудит та структуровану статистику по всіх 8 типах подій для Telegram (без звітів)."""
+    exp_refills = int(cfg.get("expected_refills", 3))
+    exp_drains = int(cfg.get("expected_drains", 2))
+    min_counts = cfg.get("expected_min_counts", {})
+
+    r_raw = events_by_type.get("REFILL", [])
+    d_raw = events_by_type.get("DRAIN", [])
+    r_clusters = _cluster_events(r_raw)
+    d_clusters = _cluster_events(d_raw)
+
+    r_dups = max(0, len(r_raw) - len(r_clusters))
+    d_dups = max(0, len(d_raw) - len(d_clusters))
+    has_missing = (len(r_clusters) < exp_refills) or (len(d_clusters) < exp_drains)
+    has_duplicates = (r_dups > 0) or (d_dups > 0) or (len(r_clusters) > exp_refills) or (len(d_clusters) > exp_drains)
+
+    fuel_delays: list[int] = []
+    instant_delays: list[int] = []
+    lines: list[str] = []
+
+    if telemetry_stats:
+        dur_str = _format_duration_sec(int(round(telemetry_stats.get("duration_sec", 0))))
+        onl = telemetry_stats.get("online_points", 0)
+        bb = telemetry_stats.get("blackbox_points", 0)
+        batches = telemetry_stats.get("blackbox_batches", 0)
+        lines.append(f"⏱ Прогін: {dur_str} | Точок: {onl + bb} ({onl} онлайн + {bb} blackbox у {batches} пакетах)")
+        lines.append("")
+
+    lines.append("📊 Статистика по типах сповіщень:")
+
+    def _append_fuel_section(title: str, sign: str, clusters: list[list[dict]], exp_cnt: int, dups: int) -> None:
+        status_icon = "✅" if (len(clusters) == exp_cnt and dups == 0) else ("❌" if len(clusters) < exp_cnt else "⚠️")
+        extra = f" | дублів/зайвих: {dups + max(0, len(clusters) - exp_cnt)}" if (dups > 0 or len(clusters) > exp_cnt) else " | дублів: 0"
+        lines.append(f"{status_icon} {title}: {len(clusters)}/{exp_cnt}{extra}")
+        for idx, cl in enumerate(clusters, 1):
+            ev = cl[0]
+            vol = ev.get("volume")
+            v_str = f"{sign}{vol:.1f} л" if isinstance(vol, (int, float)) else "—"
+            fin = ev.get("finish_ts")
+            cr = ev.get("created_ts")
+            if fin is not None and cr is not None:
+                d_sec = max(0, int(round(cr - fin)))
+                if d_sec <= 7200:
+                    fuel_delays.append(d_sec)
+            delay_s = _fmt_delay(fin, cr)
+            dup_tag = f" ⚠️ x{len(cl)}" if len(cl) > 1 else ""
+            lines.append(f"  - #{idx}: {v_str} ({_fmt_ts_kyiv(ev.get('start_ts'))}), затримка: {delay_s}{dup_tag}")
+
+    _append_fuel_section("REFILL (Заправка)", "+", r_clusters, exp_refills, r_dups)
+    _append_fuel_section("DRAIN (Злив)", "-", d_clusters, exp_drains, d_dups)
+
+    other_received = 0
+    other_dups = 0
+    for key, label in MULTIEVENT_LABELS:
+        evs = events_by_type.get(key, [])
+        min_exp = int(min_counts.get(key, 1))
+        dup_cnt = _count_instant_duplicates(evs)
+        other_received += len(evs)
+        other_dups += dup_cnt
+        if len(evs) < min_exp:
+            has_missing = True
+        if dup_cnt > 0:
+            has_duplicates = True
+
+        icon = "✅" if (len(evs) >= min_exp and dup_cnt == 0) else ("❌" if len(evs) < min_exp else "⚠️")
+        delays = [e["delay_sec"] for e in evs if e.get("delay_sec") is not None]
+        instant_delays.extend(delays)
+        delay_info = (
+            f" | затримка: {_format_duration_sec(min(delays))}..{_format_duration_sec(max(delays))}"
+            if delays
+            else ""
+        )
+        time_info = f" | {evs[0]['time']}..{evs[-1]['time']}" if len(evs) >= 2 else (f" | {evs[0]['time']}" if evs else "")
+        dup_info = f" | ДУБЛІВ: {dup_cnt}" if dup_cnt > 0 else ""
+        lines.append(f"{icon} {label}: {len(evs)} (мін >={min_exp}){time_info}{delay_info}{dup_info}")
+
+    total_dups = r_dups + d_dups + max(0, len(r_clusters) - exp_refills) + max(0, len(d_clusters) - exp_drains) + other_dups
+    total_all = len(r_clusters) + len(d_clusters) + other_received
+    lines.append("")
+    lines.append("📈 Підсумок SLA:")
+    lines.append(
+        f"• Подій отримано: {total_all} (пальне {len(r_clusters) + len(d_clusters)}/{exp_refills + exp_drains}, інші {other_received}) | Дублів: {total_dups}"
+    )
+    lines.append(f"• Затримка (пальне): {_summarize_delays(fuel_delays)}")
+    if instant_delays:
+        lines.append(f"• Затримка (інші): {_summarize_delays(instant_delays)}")
+
+    return {
+        "ok": (not has_missing) and (not has_duplicates),
+        "has_missing": has_missing,
+        "has_duplicates": has_duplicates,
+        "summary": "\n".join(lines),
+        "total_events": total_all,
+        "total_duplicates": total_dups,
+    }
+
+
+def wait_for_multievents(
+    cfg: dict,
+    start_ts: float,
+    initial_event_ids: set,
+    max_initial_id: int,
+) -> dict[str, list[dict]]:
+    """Чекає формування всіх очікуваних типів сповіщень і утримує вікно до max_wait_sec для лову дублів."""
+    log.info("Початкова пауза (%d с) перед опитуванням мультиподієвої історії...", cfg["initial_wait_sec"])
+    time.sleep(cfg["initial_wait_sec"])
+    deadline = time.monotonic() + cfg["max_wait_sec"]
+    start_poll = time.monotonic()
+    exp_r = int(cfg.get("expected_refills", 3))
+    exp_d = int(cfg.get("expected_drains", 2))
+    min_counts = cfg.get("expected_min_counts", {})
+
+    while True:
+        ev_map = collect_multievent_history(cfg, start_ts, initial_event_ids, max_initial_id)
+        r_cl = _cluster_events(ev_map["REFILL"])
+        d_cl = _cluster_events(ev_map["DRAIN"])
+        all_met = (
+            len(r_cl) >= exp_r
+            and len(d_cl) >= exp_d
+            and all(len(ev_map[k]) >= int(min_counts.get(k, 1)) for k, _ in MULTIEVENT_LABELS)
+        )
+        if not cfg.get("wait_full_window", True) and all_met:
+            return ev_map
+        if time.monotonic() >= deadline:
+            return ev_map
+
+        elapsed = int(time.monotonic() - start_poll)
+        log.info(
+            "Опитування (%d/%d с): R=%d/%d, D=%d/%d, OUT=%d, IN=%d, SPD=%d, SNS=%d, IDL=%d, CMD=%d...",
+            elapsed,
+            cfg["max_wait_sec"],
+            len(r_cl),
+            exp_r,
+            len(d_cl),
+            exp_d,
+            len(ev_map["GEO_OUT"]),
+            len(ev_map["GEO_IN"]),
+            len(ev_map["OVERSPEED"]),
+            len(ev_map["SENSOR"]),
+            len(ev_map["IDLE"]),
+            len(ev_map["COMMAND"]),
+        )
+        time.sleep(cfg["poll_interval_sec"])
+
+
+def run_multievent_canary(cfg: dict, send_fn: Callable[[dict], dict | float]) -> int:
+    """Життєвий цикл мультиподієвого монітора: відправка -> очікування -> аудит статистики -> Telegram."""
+    state = load_state(cfg)
+    label = cfg["scenario_label"]
+    log.info("Запуск %s для %s (IMEI: %s)...", label, cfg["device_name"], cfg["tracker_imei"])
+    resolve_device_id(cfg)
+
+    start_ts = time.time()
+    initial_ids, max_initial_id = get_existing_event_ids(cfg)
+    log.info("Фіксація старту: %d наявних сповіщень (max_id=%s, start_ts=%.0f)", len(initial_ids), max_initial_id, start_ts)
+
+    try:
+        res = send_fn(cfg)
+        telemetry_stats = res if isinstance(res, dict) else None
+    except Exception as exc:
+        log.error("Критична помилка в send_fn: %s", exc, exc_info=True)
+        _send_both_tg(
+            cfg,
+            f"🔴 {label}: Помилка відправки телеметрії!\nОб'єкт: {cfg['device_name']}\n\n{exc}",
+        )
+        return 1
+
+    ev_map = wait_for_multievents(cfg, start_ts, initial_ids, max_initial_id)
+    audit = audit_multievent_history(cfg, ev_map, telemetry_stats=telemetry_stats)
+    summary = audit["summary"]
+
+    if audit["ok"]:
+        log.info("Усі 8 типів сповіщень спрацювали без пропусків і дублів!\n%s", summary)
+        prefix = "🟢" if state.get("incident_open") else "✅"
+        title = "Сповіщення відновилися" if state.get("incident_open") else f"Усе чисто ({audit['total_events']} подій, 0 пропусків, 0 дублів)"
+        _send_both_tg(cfg, f"{prefix} {label}: {title}!\nОб'єкт: {cfg['device_name']}\n\n{summary}")
+        state["incident_open"] = False
+        save_state(cfg, state)
+        return 0
+
+    if not audit["has_missing"] and audit["has_duplicates"]:
+        log.warning("Виявлено дублі/зайві сповіщення!\n%s", summary)
+        _send_both_tg(cfg, f"⚠️ {label}: Виявлено ДУБЛІ/зайві події!\nОб'єкт: {cfg['device_name']}\n\n{summary}")
+        state["incident_open"] = True
+        save_state(cfg, state)
+        return 1
+
+    log.error("Виявлено пропуски сповіщень!\n%s", summary)
+    _send_both_tg(cfg, f"🔴 {label}: Пропуски або збій сповіщень!\nОб'єкт: {cfg['device_name']}\n\n{summary}")
     state["incident_open"] = True
     save_state(cfg, state)
     return 1

@@ -1,9 +1,7 @@
 name: Canary Monitor (Teltonika)
 
 on:
-  schedule:
-    # #Запускається на 45-й хвилині кожної 3-ї години (02:45, 05:45, 08:45...)
-    - cron: '45 2,5,8,11,14,17,20,23 * * *'
+  # Вимкнено cron, щоб не конфліктувати по Test_Notification_o.rosenko (9405) з великим [PROD] регресійним сценарієм
   workflow_dispatch:
 
 jobs:

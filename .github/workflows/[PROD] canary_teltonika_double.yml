@@ -1,17 +1,27 @@
-name: '[PROD] Canary Monitor (Teltonika Double Refill & Drain)'
+name: '[PROD] Teltonika Multievent Regression [5h, 300 BB]'
 
 on:
   schedule:
-    # Запускається на 42-й хвилині кожної 3-ї години (02:42, 05:42, 08:42... за Києвом)
-    - cron: '42 0,3,6,9,12,15,18,21 * * *'
+    # Автозапуск 3 рази на добу кожні 8 год (~5 год прогін + ~3 год пауза):
+    # 01:35, 09:35, 17:35 UTC (= 03:35, 11:35, 19:35 Київ взимку)
+    - cron: '35 1,9,17 * * *'
   workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: prod-canary-teltonika-multievent
+  cancel-in-progress: false
 
 jobs:
   run-canary-teltonika-double-prod:
     runs-on: ubuntu-latest
+    timeout-minutes: 345
     env:
       TZ: Europe/Kyiv
-    
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v3
@@ -21,13 +31,13 @@ jobs:
         with:
           python-version: '3.10'
           cache: 'pip'
-          
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Run Canary Script ([PROD] Teltonika Double)
+      - name: Run Canary Script ([PROD] Teltonika Multievent Regression)
         env:
           M2M_EMAIL: ${{ secrets.M2M_EMAIL }}
           M2M_PASSWORD: ${{ secrets.M2M_PASSWORD }}

@@ -1,9 +1,7 @@
 name: Canary Monitor (Wialon IPS)
 
 on:
-  schedule:
-    ## Запускається на 35-й хвилині кожної 3-ї години
-    - cron: '25 1,4,7,10,13,16,19,22 * * *'
+  # Вимкнено cron, щоб не конфліктувати по Test_Notification_o.rosenko (9405) з великим [PROD] регресійним сценарієм
   workflow_dispatch: # Дозволяє ручний запуск
 
 jobs:
